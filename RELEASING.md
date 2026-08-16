@@ -88,12 +88,18 @@ launchers can verify them. That one is already set up. Neither replaces the othe
 
 ## Cutting a release
 
-Bump the version in all three places. `tauri.conf.json` is the one the updater compares
-against, so a stale value there means installed launchers never see the release as newer:
+Bump the version in all three places, and **make sure the tag you push matches them**:
 
 - `package.json` → `version`
 - `src-tauri/tauri.conf.json` → `version`
 - `src-tauri/Cargo.toml` → `version`
+
+The tag names the release; `tauri.conf.json` is what Tauri writes into `latest.json`, and
+that is the only value installed launchers compare against. Tagging a commit `v1.0.2`
+while its `tauri.conf.json` still says `1.0.1` produces a release that *looks* newer on
+the releases page but that no installed launcher will ever offer, because the manifest
+reports a version they already have. Nothing warns you; the update just silently never
+appears.
 
 Then:
 
