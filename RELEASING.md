@@ -56,11 +56,24 @@ and safe — it only verifies signatures, it cannot create them.
 
 ## Code signing
 
-Bundles are currently unsigned, so every user is stopped on first launch and has to go
-through System Settings (macOS) or SmartScreen (Windows) to get past it. For an app aimed
-at people who do not use a terminal, that is the single biggest barrier to installing it.
+macOS bundles are ad-hoc signed, via `signingIdentity: "-"` in `tauri.conf.json`. That is
+not cosmetic, and it must not be removed.
 
-Removing it needs:
+Apple Silicon requires every executable to carry a signature, so the linker ad-hoc signs
+the binary automatically. That signature declares a resource seal. Tauri then assembles
+the `.app` around the binary, and without an explicit signing identity it never creates
+that seal — leaving a signature whose contents do not match the bundle. macOS reports
+that as **"Kayak is damaged and can't be opened. You should move it to the Bin."**, with
+no way forward. Intel builds carry no signature at all and so get the milder "could not
+verify", which does offer a way through, which is why the two architectures behaved
+differently before this was set.
+
+Signing the assembled bundle produces a valid seal and a hardened runtime, so the error
+becomes the ordinary unverified-developer warning on both architectures.
+
+What ad-hoc signing does **not** do is satisfy Gatekeeper — `spctl` still rejects the
+bundle, and every user still has to go through System Settings once. Removing that step
+entirely needs:
 
 - **macOS** — an Apple Developer account (99 USD/year) for a Developer ID certificate,
   plus notarization. Tauri reads `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`,
@@ -75,11 +88,12 @@ launchers can verify them. That one is already set up. Neither replaces the othe
 
 ## Cutting a release
 
-Bump the version in **both** places — they have to agree, or the updater will not
-recognise the new build as newer:
+Bump the version in all three places. `tauri.conf.json` is the one the updater compares
+against, so a stale value there means installed launchers never see the release as newer:
 
 - `package.json` → `version`
 - `src-tauri/tauri.conf.json` → `version`
+- `src-tauri/Cargo.toml` → `version`
 
 Then:
 

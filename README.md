@@ -12,15 +12,16 @@ offers one-click updates when a new version is published.
    [Releases](https://github.com/omaraflak/kayak-launcher/releases).
 3. Open it.
 
-Bundles are not signed, so the operating system blocks the first launch.
+Bundles carry no paid developer certificate, so the operating system blocks the first
+launch. This is a one-time step per machine.
 
 On **macOS**, you get "Apple could not verify Kayak is free of malware". Open it once and
 let it be refused, then go to **System Settings → Privacy & Security**, scroll to the
 Security section, and click **Open Anyway** next to the message about Kayak. Confirm with
-Touch ID or your password. Only the first launch needs this.
+Touch ID or your password.
 
-> Older instructions say to right-click the app and choose **Open**. That stopped working
-> in macOS 15; on macOS 15 and later, System Settings is the only route.
+> Right-clicking the app and choosing **Open** used to work instead. Apple removed that
+> route in macOS 15, so System Settings is now the only one.
 
 On **Windows**, SmartScreen shows "Windows protected your PC". Click **More info**, then
 **Run anyway**.
