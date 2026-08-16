@@ -1,0 +1,11 @@
+node_modules/
+dist/
+src-tauri/target/
+
+# Regenerated from capabilities/ on every build.
+src-tauri/gen/schemas/
+
+# Updater signing key. The private key must never be committed: anyone holding
+# it can sign an update that every installed launcher will accept and run.
+*.key
+*.key.pub
