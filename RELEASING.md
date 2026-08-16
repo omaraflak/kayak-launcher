@@ -54,6 +54,25 @@ matching public key. Two consequences:
 The matching **public** key is committed in `src-tauri/tauri.conf.json`. That is correct
 and safe — it only verifies signatures, it cannot create them.
 
+## Code signing
+
+Bundles are currently unsigned, so every user is stopped on first launch and has to go
+through System Settings (macOS) or SmartScreen (Windows) to get past it. For an app aimed
+at people who do not use a terminal, that is the single biggest barrier to installing it.
+
+Removing it needs:
+
+- **macOS** — an Apple Developer account (99 USD/year) for a Developer ID certificate,
+  plus notarization. Tauri reads `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`,
+  `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD` and `APPLE_TEAM_ID` from the
+  environment, so this is secrets on the existing workflow rather than new logic.
+- **Windows** — a code-signing certificate from a CA. An OV certificate reduces the
+  SmartScreen warning over time as reputation accrues; an EV certificate removes it
+  immediately.
+
+This is unrelated to `TAURI_SIGNING_PRIVATE_KEY`, which signs *updates* so installed
+launchers can verify them. That one is already set up. Neither replaces the other.
+
 ## Cutting a release
 
 Bump the version in **both** places — they have to agree, or the updater will not
