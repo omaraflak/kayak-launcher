@@ -102,9 +102,62 @@ fn known_locations() -> Vec<PathBuf> {
 /// retry instead of having to restart the app.
 fn docker() -> Result<Command, String> {
     let binary = locate().ok_or_else(|| "Docker is not installed".to_string())?;
-    let mut command = Command::new(binary);
+    let mut command = Command::new(&binary);
+    // Locating the CLI is not enough on its own: the CLI spawns helpers of its
+    // own and finds them on PATH. See `helper_search_path`.
+    if let Ok(path) = std::env::join_paths(helper_search_path(&binary)) {
+        command.env("PATH", path);
+    }
     suppress_console(&mut command);
     Ok(command)
+}
+
+/// Directories the Docker CLI should search for its own helper executables.
+///
+/// The CLI shells out to a credential helper named after `credsStore` in
+/// `~/.docker/config.json` -- `docker-credential-desktop`, `-osxkeychain`, and
+/// so on -- and resolves it through PATH. An app launched from Finder or the
+/// Start menu inherits a minimal PATH containing none of Docker's directories,
+/// so a pull fails with:
+///
+/// ```text
+/// error getting credentials - err: exec: "docker-credential-desktop":
+/// executable file not found in $PATH
+/// ```
+///
+/// Whether this bites depends on where a particular Docker install puts the CLI
+/// relative to its helpers, which is why it reproduces on some machines and not
+/// others. Putting every known Docker directory on the child's PATH makes it
+/// independent of that layout.
+fn helper_search_path(binary: &Path) -> Vec<PathBuf> {
+    let mut preferred: Vec<PathBuf> = Vec::new();
+    // The helper usually ships alongside the CLI, so its directory comes first.
+    if let Some(parent) = binary.parent() {
+        preferred.push(parent.to_path_buf());
+    }
+    preferred.extend(known_locations().iter().filter_map(|candidate| {
+        candidate.parent().map(Path::to_path_buf)
+    }));
+
+    let inherited = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+
+    merge_search_dirs(preferred, inherited)
+}
+
+/// Concatenates two directory lists, keeping first occurrences only.
+///
+/// Order matters: Docker's own directories are searched before the inherited
+/// PATH, so a helper shipped with the install wins over an unrelated binary of
+/// the same name earlier in the user's PATH.
+fn merge_search_dirs(preferred: Vec<PathBuf>, inherited: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut seen = std::collections::HashSet::new();
+    preferred
+        .into_iter()
+        .chain(inherited)
+        .filter(|dir| !dir.as_os_str().is_empty() && seen.insert(dir.clone()))
+        .collect()
 }
 
 /// Stops Windows from flashing a console window for each CLI call.
@@ -246,7 +299,51 @@ pub fn pull<F>(image: &str, mut on_progress: F) -> Result<(), String>
 where
     F: FnMut(PullProgress),
 {
-    let mut child = docker()?
+    match pull_once(image, None, &mut on_progress) {
+        Err(error) if is_credential_failure(&error) => {
+            // The user's Docker config names a credential helper that cannot be
+            // run. Both Kayak images are public, so the pull needs no
+            // credentials at all and can be retried against a config that asks
+            // for none, rather than failing a first launch over it.
+            let config = credential_free_config()?;
+            pull_once(image, Some(&config), &mut on_progress)
+        }
+        result => result,
+    }
+}
+
+/// Reports whether a failure came from Docker's credential helper machinery.
+fn is_credential_failure(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("docker-credential") || error.contains("error getting credentials")
+}
+
+/// Creates a throwaway Docker config directory that names no credential helper.
+///
+/// Only the pull is redirected to it. Everything else keeps using the real
+/// config, so proxy settings and daemon contexts defined there still apply.
+fn credential_free_config() -> Result<PathBuf, String> {
+    let dir = std::env::temp_dir().join("kayak-launcher-docker-config");
+    std::fs::create_dir_all(&dir)
+        .map_err(|err| format!("Could not create a temporary Docker config: {err}"))?;
+    std::fs::write(dir.join("config.json"), "{}\n")
+        .map_err(|err| format!("Could not write a temporary Docker config: {err}"))?;
+    Ok(dir)
+}
+
+/// One `docker pull` attempt.
+fn pull_once(
+    image: &str,
+    config_dir: Option<&Path>,
+    on_progress: &mut dyn FnMut(PullProgress),
+) -> Result<(), String> {
+    let mut command = docker()?;
+    // `--config` is a global flag and has to precede the subcommand.
+    if let Some(dir) = config_dir {
+        command.arg("--config").arg(dir);
+    }
+
+    let mut child = command
         .args(["pull", image])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -579,6 +676,67 @@ mod tests {
 
         assert!(absorb_line("a1b2c3d4e5f6: Downloading", &mut layers).is_some());
         assert!(absorb_line("a1b2c3d4e5f6: Downloading", &mut layers).is_none());
+    }
+
+    #[test]
+    fn docker_directories_are_searched_before_the_inherited_path() {
+        // A helper shipped with the Docker install must win over an unrelated
+        // binary of the same name sitting earlier in the user's PATH.
+        let merged = merge_search_dirs(
+            vec![PathBuf::from("/usr/local/bin")],
+            vec![PathBuf::from("/opt/mystuff/bin"), PathBuf::from("/usr/bin")],
+        );
+
+        assert_eq!(merged[0], PathBuf::from("/usr/local/bin"));
+        assert_eq!(merged.len(), 3);
+    }
+
+    #[test]
+    fn search_directories_are_deduplicated() {
+        let merged = merge_search_dirs(
+            vec![PathBuf::from("/usr/local/bin"), PathBuf::from("/usr/bin")],
+            vec![PathBuf::from("/usr/local/bin"), PathBuf::from("/bin")],
+        );
+
+        assert_eq!(
+            merged,
+            vec![
+                PathBuf::from("/usr/local/bin"),
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/bin"),
+            ]
+        );
+    }
+
+    #[test]
+    fn empty_path_entries_are_dropped() {
+        // An empty entry in PATH means "the current directory" to some tools,
+        // which is not somewhere we want a helper resolved from.
+        let merged = merge_search_dirs(vec![], vec![PathBuf::from(""), PathBuf::from("/bin")]);
+
+        assert_eq!(merged, vec![PathBuf::from("/bin")]);
+    }
+
+    #[test]
+    fn recognises_credential_helper_failures() {
+        assert!(is_credential_failure(
+            "error getting credentials - err: exec: \"docker-credential-desktop\": \
+             executable file not found in $PATH, out: ``"
+        ));
+        assert!(is_credential_failure(
+            "docker-credential-osxkeychain not found"
+        ));
+    }
+
+    #[test]
+    fn leaves_unrelated_failures_alone() {
+        // Retrying these against a different config would only waste a second
+        // attempt and report the wrong cause.
+        assert!(!is_credential_failure("no such host"));
+        assert!(!is_credential_failure(
+            "manifest for omaraflak/kayak:latest not found"
+        ));
+        assert!(!is_credential_failure("no space left on device"));
     }
 
     #[test]
