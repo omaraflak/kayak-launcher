@@ -1,7 +1,7 @@
 # Releasing the launcher
 
 Pushing a version tag builds the launcher for macOS (Apple Silicon and Intel), Windows,
-and Linux, and opens a **draft** GitHub release with the installers attached.
+and Linux, and publishes a GitHub release with the installers attached.
 
 This is separate from releasing Kayak itself. Kayak updates through Docker Hub and
 should change often; the launcher updates through GitHub Releases and should barely
@@ -112,13 +112,17 @@ git push --follow-tags
 Watch it at https://github.com/omaraflak/kayak-launcher/actions. Four builds run in
 parallel; expect ten to twenty minutes.
 
-## Publishing the draft
+## After the build
 
-The workflow leaves the release as a **draft** on purpose. Nothing reaches users until
-you publish it.
+The release publishes itself. Pushing the tag is the whole of it: the workflow attaches
+the installers and `latest.json`, marks the release latest, and installed launchers begin
+offering the update on their next check.
 
-Go to https://github.com/omaraflak/kayak-launcher/releases, check the installers are all
-attached and that `latest.json` is among them, then **Publish release**.
+Confirm it went out with:
 
-Publishing is the moment installed launchers start offering the update, because the
-updater endpoint reads `latest.json` from whichever release is newest and published.
+```bash
+curl -sL https://github.com/omaraflak/kayak-launcher/releases/latest/download/latest.json | grep -o '"version":"[^"]*"'
+```
+
+That must report the version you just tagged. If it reports an older one, the tag and
+`tauri.conf.json` disagree and no installed launcher will take the update.

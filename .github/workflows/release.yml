@@ -81,7 +81,11 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: Kayak ${{ github.ref_name }}
-          releaseDraft: true
+          # Published straight away rather than left as a draft. A draft is
+          # invisible to everyone but the repository owner, and `releases/latest`
+          # skips it, so an unpublished draft silently means both "no download
+          # link" and "no update for anyone already installed".
+          releaseDraft: false
           prerelease: false
           # Produces the latest.json manifest the updater plugin polls.
           includeUpdaterJson: true
