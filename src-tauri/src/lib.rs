@@ -6,7 +6,9 @@
 //! release can be installed from a button rather than a `docker pull`.
 
 mod config;
+mod control;
 mod docker;
+mod metal;
 mod paths;
 mod registry;
 
@@ -89,6 +91,9 @@ pub struct Launcher {
     stage: Mutex<Stage>,
     update: Mutex<UpdateInfo>,
     port: Mutex<Option<u16>>,
+    /// The Metal inference server, when one is running. Native to the host
+    /// rather than containerised, because Metal has no passthrough into Docker.
+    metal: Mutex<Option<metal::Server>>,
     /// Guards the boot and update sequences so a double-click cannot run two
     /// `docker run` calls against the same container name.
     busy: AtomicBool,
@@ -100,6 +105,7 @@ impl Launcher {
             stage: Mutex::new(Stage::Checking),
             update: Mutex::new(UpdateInfo::default()),
             port: Mutex::new(None),
+            metal: Mutex::new(None),
             busy: AtomicBool::new(false),
         }
     }
@@ -279,6 +285,12 @@ fn boot(app: AppHandle, state: Arc<Launcher>) {
     // the Kayak window is the only launcher surface the user needs.
     if let Some(window) = app.get_webview_window(LAUNCHER_WINDOW) {
         let _ = window.hide();
+    }
+
+    // Started only once Kayak is serving: the control channel lives in the
+    // data directory, which is not seeded until the container has run.
+    if let Ok(data_dir) = paths::ensure_data_dir() {
+        spawn_metal_reconciler(state.clone(), data_dir);
     }
 
     spawn_update_watcher(app, state);
@@ -606,6 +618,121 @@ fn ensure_images_for_update(app: &AppHandle, force: bool) -> Result<(), String> 
     Ok(())
 }
 
+/// Port the Metal server listens on.
+///
+/// Deliberately the same port the containerised vLLM would publish, so Kayak
+/// reaches either backend through the one `VLLM_API_BASE` it already has.
+const METAL_PORT: u16 = 8001;
+
+/// Drives the Metal server towards whatever Kayak has asked for.
+///
+/// Runs on its own thread and is allowed to block: installing the environment
+/// downloads gigabytes and takes minutes, and doing that inline keeps the whole
+/// sequence in one place instead of spread across a state machine.
+fn reconcile_metal(state: &Launcher, paths: &control::ControlPaths) {
+    let supported = metal::is_apple_silicon();
+    let mut status = control::MetalStatus {
+        supported,
+        installed: metal::is_installed(),
+        state: "stopped".to_string(),
+        port: METAL_PORT,
+        ..Default::default()
+    };
+
+    if !supported {
+        // Nothing else can be true on this machine, and saying so lets Kayak
+        // hide the option rather than offer something that cannot work.
+        let _ = control::write_status(&paths.status, &control::Status { metal: status });
+        return;
+    }
+
+    let desired = control::read_desired(&paths.desired);
+    let wanted = desired
+        .metal
+        .running
+        .then(|| desired.metal.model.clone())
+        .flatten()
+        .filter(|model| control::accepts_model(model));
+
+    let Some(model) = wanted else {
+        // Either nothing is wanted or what was asked for is not servable; both
+        // mean any running server should come down.
+        if let Some(server) = state.metal.lock().unwrap().take() {
+            server.stop();
+        }
+        if desired.metal.running {
+            status.error = Some(
+                "Metal inference serves MLX models only, published under mlx-community."
+                    .to_string(),
+            );
+            status.state = "error".to_string();
+        }
+        let _ = control::write_status(&paths.status, &control::Status { metal: status });
+        return;
+    };
+
+    // A server already serving the right model just needs its health reported.
+    {
+        let mut running = state.metal.lock().unwrap();
+        if let Some(server) = running.as_mut() {
+            if server.model == model && server.is_alive() {
+                status.model = Some(model);
+                status.state = if metal::is_healthy(METAL_PORT) {
+                    "ready"
+                } else {
+                    "starting"
+                }
+                .to_string();
+                let _ = control::write_status(&paths.status, &control::Status { metal: status });
+                return;
+            }
+        }
+        // Wrong model, or the process died on its own.
+        if let Some(server) = running.take() {
+            server.stop();
+        }
+    }
+
+    if !metal::is_installed() {
+        status.state = "installing".to_string();
+        status.model = Some(model.clone());
+        let _ = control::write_status(&paths.status, &control::Status { metal: status.clone() });
+
+        if let Err(error) = metal::run_install(|_| {}) {
+            status.state = "error".to_string();
+            status.error = Some(error);
+            let _ = control::write_status(&paths.status, &control::Status { metal: status });
+            return;
+        }
+        status.installed = true;
+    }
+
+    match metal::spawn_server(&model, METAL_PORT) {
+        Ok(server) => {
+            *state.metal.lock().unwrap() = Some(server);
+            status.state = "starting".to_string();
+            status.model = Some(model);
+        }
+        Err(error) => {
+            status.state = "error".to_string();
+            status.error = Some(error);
+        }
+    }
+    let _ = control::write_status(&paths.status, &control::Status { metal: status });
+}
+
+/// Polls the control channel for as long as the app runs.
+fn spawn_metal_reconciler(state: Arc<Launcher>, data_dir: std::path::PathBuf) {
+    thread::spawn(move || {
+        let paths = control::ControlPaths::under(&data_dir);
+        let _ = std::fs::create_dir_all(&paths.dir);
+        loop {
+            reconcile_metal(&state, &paths);
+            thread::sleep(Duration::from_secs(2));
+        }
+    });
+}
+
 /// Stops the container the launcher started.
 fn shutdown() {
     let _ = docker::stop_container(config::CONTAINER_NAME);
@@ -719,10 +846,16 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("could not start the launcher")
-        .run(|_app, event| {
-            // The container outlives the process unless it is stopped here, and
-            // a server left running would keep serving an app with no window.
+        .run(|app, event| {
+            // Both the container and the Metal server outlive this process
+            // unless they are stopped here, and either one left running would
+            // keep serving an app that no longer has a window.
             if let RunEvent::Exit = event {
+                if let Some(state) = app.try_state::<Arc<Launcher>>() {
+                    if let Some(server) = state.metal.lock().unwrap().take() {
+                        server.stop();
+                    }
+                }
                 shutdown();
             }
         });
