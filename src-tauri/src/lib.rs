@@ -21,6 +21,7 @@ use serde::Serialize;
 use tauri::{
     AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
+use tauri_plugin_updater::UpdaterExt;
 
 const LAUNCHER_WINDOW: &str = "launcher";
 const KAYAK_WINDOW: &str = "kayak";
@@ -94,6 +95,12 @@ pub struct Launcher {
     /// The Metal inference server, when one is running. Native to the host
     /// rather than containerised, because Metal has no passthrough into Docker.
     metal: Mutex<Option<metal::Server>>,
+    /// A launcher update waiting to be installed, held so the button in the
+    /// Kayak window can apply the one already found rather than checking again.
+    launcher_update: Mutex<Option<tauri_plugin_updater::Update>>,
+    /// Set once the app has begun stopping, so the close handler runs its
+    /// sequence once and the second close request is allowed through.
+    shutting_down: AtomicBool,
     /// Guards the boot and update sequences so a double-click cannot run two
     /// `docker run` calls against the same container name.
     busy: AtomicBool,
@@ -106,6 +113,8 @@ impl Launcher {
             update: Mutex::new(UpdateInfo::default()),
             port: Mutex::new(None),
             metal: Mutex::new(None),
+            launcher_update: Mutex::new(None),
+            shutting_down: AtomicBool::new(false),
             busy: AtomicBool::new(false),
         }
     }
@@ -395,9 +404,14 @@ fn show_kayak(app: &AppHandle, url: &str) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(KAYAK_WINDOW) {
         window.on_window_event(move |event| {
             // Closing Kayak quits, rather than leaving a hidden launcher window
-            // and an orphaned container behind.
-            if matches!(event, WindowEvent::CloseRequested { .. }) {
-                close_handle.exit(0);
+            // and an orphaned container behind. The close is held off while the
+            // container stops so the window can say what is happening.
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                let Some(state) = close_handle.try_state::<Arc<Launcher>>() else {
+                    return;
+                };
+                api.prevent_close();
+                begin_shutdown(close_handle.clone(), state.inner().clone());
             }
         });
     }
@@ -438,6 +452,105 @@ fn show_banner_progress(app: &AppHandle, message: &str, percent: i32) {
     );
 }
 
+/// Draws whatever the user should currently be told, into the Kayak window.
+///
+/// Called both when something changes and when the page announces itself, so a
+/// banner survives a reload and no longer depends on the webview happening to
+/// have a document at the moment a check finished.
+fn push_banner_state(app: &AppHandle, state: &Launcher) {
+    // A launcher update wins when both are pending: installing it restarts the
+    // app, which would abandon a Kayak update halfway.
+    if let Some(update) = state.launcher_update.lock().unwrap().as_ref() {
+        eval_in_kayak(
+            app,
+            &format!(
+                "window.__kayakLauncher && window.__kayakLauncher.showUpdate({{kind: \"launcher\", version: {}}})",
+                js_literal(&update.version)
+            ),
+        );
+        return;
+    }
+
+    let update = state.update.lock().unwrap().clone();
+    if update.available {
+        show_banner(app, &update);
+    }
+}
+
+/// Asks GitHub whether a newer launcher has been published.
+///
+/// Runs in Rust rather than the launcher window's page because that window is
+/// hidden once Kayak opens, so an update found there would never be seen.
+fn check_launcher_update(app: AppHandle, state: Arc<Launcher>) {
+    let Ok(updater) = app.updater() else {
+        return;
+    };
+    let found = match tauri::async_runtime::block_on(updater.check()) {
+        Ok(found) => found,
+        // Offline, or no release published yet. Neither is worth reporting.
+        Err(_) => return,
+    };
+    let Some(update) = found else {
+        return;
+    };
+
+    let version = update.version.clone();
+    *state.launcher_update.lock().unwrap() = Some(update);
+    let _ = app.emit("launcher-update", version);
+    push_banner_state(&app, &state);
+}
+
+/// Downloads and installs the launcher update, then restarts into it.
+fn apply_launcher_update(app: AppHandle, state: Arc<Launcher>) {
+    let Some(update) = state.launcher_update.lock().unwrap().take() else {
+        return;
+    };
+
+    show_banner_progress(&app, "Downloading the new app", -1);
+    let outcome =
+        tauri::async_runtime::block_on(update.download_and_install(|_, _| {}, || {}));
+
+    match outcome {
+        Ok(()) => {
+            // The container is stopped first: the restart replaces this process,
+            // and an orphaned container would then refuse the name on the way
+            // back up.
+            shutdown();
+            app.restart();
+        }
+        Err(error) => {
+            eval_in_kayak(
+                &app,
+                &format!(
+                    "window.__kayakLauncher && window.__kayakLauncher.showError({})",
+                    js_literal(&format!("The app could not be updated: {error}"))
+                ),
+            );
+        }
+    }
+}
+
+/// Stops everything the launcher started, then quits.
+///
+/// Run on its own thread with the window still up: `docker stop` gives the
+/// server ten seconds to close its database, and doing that on the main thread
+/// froze the window for the duration, which reads as a crash rather than a
+/// shutdown.
+fn begin_shutdown(app: AppHandle, state: Arc<Launcher>) {
+    if state.shutting_down.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    eval_in_kayak(&app, "window.__kayakLauncher && window.__kayakLauncher.showShutdown()");
+
+    thread::spawn(move || {
+        if let Some(server) = state.metal.lock().unwrap().take() {
+            server.stop();
+        }
+        shutdown();
+        app.exit(0);
+    });
+}
+
 /// Responds to a button press in the injected banner.
 fn handle_banner_action(app: &AppHandle, action: String) {
     let Some(state) = app.try_state::<Arc<Launcher>>() else {
@@ -446,9 +559,16 @@ fn handle_banner_action(app: &AppHandle, action: String) {
     let state = state.inner().clone();
 
     match action.as_str() {
+        // The page has a document and can be drawn on. Anything found before
+        // this point was pushed into a webview that could not receive it.
+        "ready" => push_banner_state(app, &state),
         "update" => {
             let app = app.clone();
             thread::spawn(move || apply_update(app, state));
+        }
+        "self-update" => {
+            let app = app.clone();
+            thread::spawn(move || apply_launcher_update(app, state));
         }
         "dismiss" => {
             let mut update = state.update.lock().unwrap();
@@ -508,18 +628,17 @@ fn check_for_updates(app: AppHandle, state: Arc<Launcher>) {
         }
     };
 
-    let available = info.available;
-    set_update(&app, &state, info.clone());
-
-    if available {
-        show_banner(&app, &info);
-    }
+    set_update(&app, &state, info);
+    push_banner_state(&app, &state);
 }
 
 /// Checks at startup and then on a long interval, for the life of the app.
 fn spawn_update_watcher(app: AppHandle, state: Arc<Launcher>) {
     thread::spawn(move || loop {
         check_for_updates(app.clone(), state.clone());
+        // Checked on the same schedule so a launcher released while the app is
+        // open is offered too, rather than only at the next cold start.
+        check_launcher_update(app.clone(), state.clone());
         thread::sleep(UPDATE_INTERVAL);
     });
 }
@@ -811,6 +930,13 @@ fn open_kayak(app: AppHandle, state: tauri::State<'_, Arc<Launcher>>) -> Result<
     show_kayak(&app, &format!("http://127.0.0.1:{port}"))
 }
 
+/// Installs a launcher update already found by the background check.
+#[tauri::command]
+fn install_launcher_update(app: AppHandle, state: tauri::State<'_, Arc<Launcher>>) {
+    let state = state.inner().clone();
+    thread::spawn(move || apply_launcher_update(app, state));
+}
+
 #[tauri::command]
 fn check_updates(app: AppHandle, state: tauri::State<'_, Arc<Launcher>>) {
     let state = state.inner().clone();
@@ -837,6 +963,7 @@ pub fn run() {
             open_kayak,
             check_updates,
             install_update,
+            install_launcher_update,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -846,11 +973,32 @@ pub fn run() {
         })
         .build(tauri::generate_context!())
         .expect("could not start the launcher")
-        .run(|app, event| {
-            // Both the container and the Metal server outlive this process
-            // unless they are stopped here, and either one left running would
+        .run(|app, event| match event {
+            // Quitting from the menu, the Dock or Cmd+Q arrives here rather
+            // than as a window close, and it needs the same treatment: the
+            // stop takes seconds, and doing it inline freezes the window.
+            RunEvent::ExitRequested { api, .. } => {
+                let Some(state) = app.try_state::<Arc<Launcher>>() else {
+                    return;
+                };
+                if state.shutting_down.load(Ordering::SeqCst) {
+                    // Already stopping; this is the exit that sequence asked
+                    // for, so let it through.
+                    return;
+                }
+                api.prevent_exit();
+                begin_shutdown(app.clone(), state.inner().clone());
+            }
+            // Last resort. Both the container and the Metal server outlive this
+            // process unless they are stopped, and either left running would
             // keep serving an app that no longer has a window.
-            if let RunEvent::Exit = event {
+            RunEvent::Exit => {
+                let already = app
+                    .try_state::<Arc<Launcher>>()
+                    .is_some_and(|state| state.shutting_down.swap(true, Ordering::SeqCst));
+                if already {
+                    return;
+                }
                 if let Some(state) = app.try_state::<Arc<Launcher>>() {
                     if let Some(server) = state.metal.lock().unwrap().take() {
                         server.stop();
@@ -858,5 +1006,6 @@ pub fn run() {
                 }
                 shutdown();
             }
+            _ => {}
         });
 }

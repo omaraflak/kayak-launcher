@@ -1,8 +1,6 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { relaunch } from "@tauri-apps/plugin-process";
-import { check, type Update } from "@tauri-apps/plugin-updater";
 
 /** Mirrors the `Stage` enum in the Rust side. */
 type Stage =
@@ -39,8 +37,14 @@ const body = document.getElementById("body") as HTMLElement;
 const footer = document.getElementById("footer") as HTMLElement;
 const version = document.getElementById("version") as HTMLElement;
 
-/** A pending launcher update from GitHub Releases, once one has been found. */
-let launcherUpdate: Update | null = null;
+/**
+ * Version of a pending launcher update, once the backend has found one.
+ *
+ * The check runs in Rust rather than here, because this window is hidden as
+ * soon as Kayak opens and an update found in it would never be seen. Rust also
+ * shows it as a banner inside the Kayak window.
+ */
+let launcherUpdate: string | null = null;
 
 /** Last known Kayak update state, so the footer can be redrawn on its own. */
 let lastUpdate: UpdateInfo = {
@@ -199,9 +203,11 @@ function renderUpdate(info: UpdateInfo): void {
   // restarts the app, which would interrupt a Kayak update mid-flight.
   if (launcherUpdate) {
     footer.appendChild(
-      element("span", undefined, `Launcher ${launcherUpdate.version} is available. `),
+      element("span", undefined, `Launcher ${launcherUpdate} is available. `),
     );
-    footer.appendChild(button("Update and restart", () => void installLauncher()));
+    footer.appendChild(
+      button("Update and restart", () => void invoke("install_launcher_update")),
+    );
     return;
   }
 
@@ -227,21 +233,6 @@ function renderUpdate(info: UpdateInfo): void {
   footer.textContent = "";
 }
 
-/** Downloads and installs a launcher update, then restarts into it. */
-async function installLauncher(): Promise<void> {
-  if (!launcherUpdate) return;
-  footer.textContent = "Installing the launcher update…";
-  try {
-    await launcherUpdate.downloadAndInstall();
-    await relaunch();
-  } catch (error) {
-    // Clearing this puts the Kayak update back in the footer, so a launcher
-    // problem does not hide an available Kayak update behind it.
-    launcherUpdate = null;
-    footer.textContent = `The launcher could not be updated: ${error}`;
-  }
-}
-
 async function main(): Promise<void> {
   await listen<Stage>("stage", (event) => render(event.payload));
   await listen<UpdateInfo>("update", (event) => renderUpdate(event.payload));
@@ -252,18 +243,12 @@ async function main(): Promise<void> {
   render(snapshot.stage);
   renderUpdate(snapshot.update);
 
-  // Checked once, at startup. The launcher itself changes rarely, and applying
-  // an update to it restarts the app, so polling mid-session would interrupt
-  // whatever the user is doing in Kayak for no real benefit.
-  try {
-    const found = await check();
-    if (found) {
-      launcherUpdate = found;
-      renderUpdate(lastUpdate);
-    }
-  } catch {
-    // Offline, or no release published yet. Kayak runs regardless.
-  }
+  // Launcher updates are found in Rust and announced here, so this window and
+  // the banner inside the Kayak window agree without checking twice.
+  await listen<string>("launcher-update", (event) => {
+    launcherUpdate = event.payload;
+    renderUpdate(lastUpdate);
+  });
 }
 
 void main();

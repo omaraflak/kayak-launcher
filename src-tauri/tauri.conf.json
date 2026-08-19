@@ -1,7 +1,7 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
   "productName": "Kayak",
-  "version": "1.0.4",
+  "version": "1.0.5",
   "identifier": "com.omaraflak.kayak.launcher",
   "build": {
     "beforeDevCommand": "npm run dev",
