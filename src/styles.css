@@ -53,29 +53,22 @@ body {
   display: flex;
   flex-direction: column;
   height: 100%;
-  padding: 28px 32px 24px;
+  padding: 32px 32px 24px;
+  gap: 4px;
 }
 
-.brand {
-  display: flex;
-  align-items: center;
-  gap: 14px;
-}
-
+/* The mark sits centred above the status, with the window title carrying the
+   product name instead of a wordmark beside it. */
 .mark {
   display: flex;
+  justify-content: center;
+  padding-top: 4px;
 }
 
-.brand-text h1 {
+.version {
   margin: 0;
-  font-size: 20px;
-  font-weight: 600;
-  letter-spacing: -0.01em;
-}
-
-.brand-text p {
-  margin: 2px 0 0;
-  font-size: 12px;
+  text-align: center;
+  font-size: 11px;
   color: var(--on-surface-variant);
 }
 

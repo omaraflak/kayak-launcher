@@ -30,7 +30,10 @@ PLATE_RADIUS = 0.235
 # half-width HULL_W and half-length HULL_L gives the circle radius and offset.
 HULL_W = 0.090
 HULL_L = 0.370
-HULL_ANGLE = math.radians(-35.0)
+#: Exactly 45 degrees, so the hull sits on the square's diagonal. Anything else
+#: reads as a mistake rather than a choice, because the plate it sits on gives
+#: the eye a perfect diagonal to compare against.
+HULL_ANGLE = math.radians(-45.0)
 
 # Paddle laid across the hull, with a knocked-out gap so the two shapes read as
 # separate silhouettes rather than merging into one blob.

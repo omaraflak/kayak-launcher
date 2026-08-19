@@ -8,42 +8,41 @@
   </head>
   <body>
     <main id="app">
-      <header class="brand">
-        <div class="mark" aria-hidden="true">
-          <svg viewBox="0 0 100 100" width="40" height="40">
-            <rect width="100" height="100" rx="24" fill="var(--primary)" />
+      <!--
+        The mark alone, centred above the status. The window is titled Kayak,
+        so a wordmark beside the icon only repeated what the title bar says.
+      -->
+      <div class="mark" aria-hidden="true">
+        <svg viewBox="0 0 100 100" width="56" height="56">
+          <rect width="100" height="100" rx="24" fill="var(--primary)" />
+          <!--
+            Exactly 45 degrees, so the hull sits on the plate's diagonal. Hull
+            and paddle share the rotation, which keeps them perpendicular, and
+            the paddle is drawn first so the hull stays one unbroken shape.
+          -->
+          <g transform="rotate(-45 50 50)">
+            <rect x="17" y="45.5" width="66" height="9" rx="4.5" fill="#fff" />
             <!--
-              Hull and paddle share a rotation so they stay perpendicular, and
-              the paddle is drawn first so the hull stays one unbroken shape.
-              The hull's stroke is the plate colour, which reads as a gap.
+              The stroke is centred on the outline, so half of it eats into the
+              hull. These radii are larger than the visible hull by that half
+              width, which is what keeps this matching the app icon.
             -->
-            <g transform="rotate(-35 50 50)">
-              <rect x="17" y="45.5" width="66" height="9" rx="4.5" fill="#fff" />
-              <!--
-                The stroke is centred on the outline, so half of it eats into
-                the hull. These radii are larger than the visible hull by that
-                half-width, which is what keeps this matching the app icon.
-              -->
-              <ellipse
-                cx="50"
-                cy="50"
-                rx="11.5"
-                ry="39.5"
-                fill="#fff"
-                stroke="var(--primary)"
-                stroke-width="5.2"
-              />
-            </g>
-          </svg>
-        </div>
-        <div class="brand-text">
-          <h1>Kayak</h1>
-          <p id="version">&nbsp;</p>
-        </div>
-      </header>
+            <ellipse
+              cx="50"
+              cy="50"
+              rx="11.5"
+              ry="39.5"
+              fill="#fff"
+              stroke="var(--primary)"
+              stroke-width="5.2"
+            />
+          </g>
+        </svg>
+      </div>
 
       <section id="body" class="body"></section>
 
+      <p id="version" class="version">&nbsp;</p>
       <footer id="footer" class="footer"></footer>
     </main>
     <script type="module" src="/src/main.ts"></script>

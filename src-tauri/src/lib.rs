@@ -18,6 +18,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
+use tauri::menu::{AboutMetadata, Menu, MenuBuilder, SubmenuBuilder};
 use tauri::{
     AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent,
 };
@@ -452,6 +453,68 @@ fn show_banner_progress(app: &AppHandle, message: &str, percent: i32) {
     );
 }
 
+/// Builds the application menu, with both versions in the About panel.
+///
+/// Two separate things are installed on a user's machine and either can be out
+/// of date independently: this launcher, which updates through GitHub, and the
+/// Kayak server image, which updates through Docker Hub. The About panel showed
+/// only the launcher's version, which is the less interesting of the two --
+/// Kayak is what the user actually works in.
+///
+/// The menu is rebuilt rather than mutated because the Kayak version is not
+/// known at startup: it is read from the image label once the container is up.
+fn build_menu(app: &AppHandle, kayak_version: Option<&str>) -> tauri::Result<Menu<tauri::Wry>> {
+    let about = AboutMetadata {
+        version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        comments: Some(match kayak_version {
+            Some(version) => format!("Kayak {version}"),
+            None => "Kayak is not running yet".to_string(),
+        }),
+        ..Default::default()
+    };
+
+    let application = SubmenuBuilder::new(app, "Kayak")
+        .about(Some(about))
+        .separator()
+        .services()
+        .separator()
+        .hide()
+        .hide_others()
+        .show_all()
+        .separator()
+        .quit()
+        .build()?;
+
+    // Rebuilt explicitly because replacing the menu drops the defaults, and
+    // without these the Kayak window loses copy and paste entirely.
+    let edit = SubmenuBuilder::new(app, "Edit")
+        .undo()
+        .redo()
+        .separator()
+        .cut()
+        .copy()
+        .paste()
+        .select_all()
+        .build()?;
+
+    let window = SubmenuBuilder::new(app, "Window")
+        .minimize()
+        .separator()
+        .close_window()
+        .build()?;
+
+    MenuBuilder::new(app)
+        .items(&[&application, &edit, &window])
+        .build()
+}
+
+/// Puts the Kayak version into the About panel once it is known.
+fn refresh_menu(app: &AppHandle, kayak_version: Option<&str>) {
+    if let Ok(menu) = build_menu(app, kayak_version) {
+        let _ = app.set_menu(menu);
+    }
+}
+
 /// Draws whatever the user should currently be told, into the Kayak window.
 ///
 /// Called both when something changes and when the page announces itself, so a
@@ -628,6 +691,10 @@ fn check_for_updates(app: AppHandle, state: Arc<Launcher>) {
         }
     };
 
+    // Read from the result rather than from the stored state, which still holds
+    // the previous check at this point and would leave the menu a check behind.
+    refresh_menu(&app, info.installed.as_deref());
+
     set_update(&app, &state, info);
     push_banner_state(&app, &state);
 }
@@ -650,6 +717,14 @@ fn apply_update(app: AppHandle, state: Arc<Launcher>) {
     };
 
     show_banner_progress(&app, "Downloading the new version", -1);
+
+    // Noted before the pull: repointing a tag leaves the image it replaced
+    // behind, untagged and several gigabytes large, and after the pull there is
+    // no way to tell which of the untagged images used to be ours.
+    let superseded: Vec<String> = [config::server_image(), config::sandbox_image()]
+        .iter()
+        .filter_map(|image| docker::image_id(image))
+        .collect();
 
     let result = (|| -> Result<u16, String> {
         // `force` because the tags are already present locally; the point of the
@@ -679,6 +754,18 @@ fn apply_update(app: AppHandle, state: Arc<Launcher>) {
 
     match result {
         Ok(port) => {
+            // Only now, with the new container running: Docker refuses to
+            // remove an image a container still references, so doing this any
+            // earlier would fail on the very image being replaced. Failures are
+            // ignored, since anything still in use should stay.
+            for id in superseded {
+                if docker::image_id(&config::server_image()).as_deref() != Some(id.as_str())
+                    && docker::image_id(&config::sandbox_image()).as_deref() != Some(id.as_str())
+                {
+                    let _ = docker::remove_image(&id);
+                }
+            }
+
             *state.port.lock().unwrap() = Some(port);
             let url = format!("http://127.0.0.1:{port}");
             set_update(
@@ -967,6 +1054,7 @@ pub fn run() {
         ])
         .setup(|app| {
             let handle = app.handle().clone();
+            refresh_menu(&handle, None);
             let state = app.state::<Arc<Launcher>>().inner().clone();
             thread::spawn(move || boot(handle, state));
             Ok(())

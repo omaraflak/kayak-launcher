@@ -290,6 +290,24 @@ pub fn image_version(image: &str) -> Option<String> {
     Some(version.to_string())
 }
 
+/// Returns the local image ID a tag currently points at.
+///
+/// Captured before a pull so the image it replaces can be identified
+/// afterwards: repointing a tag leaves the old image behind with no tag, and
+/// these are multi-gigabyte.
+pub fn image_id(image: &str) -> Option<String> {
+    run(&["image", "inspect", image, "--format", "{{.Id}}"]).ok()
+}
+
+/// Deletes an image by ID.
+///
+/// Failure is expected and ignored by callers: Docker refuses to remove an
+/// image a container still references, which is the correct outcome when
+/// something is still using it.
+pub fn remove_image(id: &str) -> Result<(), String> {
+    run(&["image", "rm", id]).map(|_| ())
+}
+
 /// Pulls an image, reporting layer-level progress.
 ///
 /// Progress is counted in layers rather than bytes because Docker only prints
