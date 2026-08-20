@@ -197,9 +197,7 @@ fn ensure_images(app: &AppHandle, state: &Launcher, force: bool) -> Result<(), S
     if force || !docker::has_image(&server) {
         wanted.push((server.as_str(), "Kayak"));
     }
-    // The server starts sandboxes from an unqualified local tag, so a missing
-    // retag is as bad as a missing image.
-    if force || !docker::has_image(&sandbox) || !docker::has_image(config::SANDBOX_LOCAL_TAG) {
+    if force || !docker::has_image(&sandbox) {
         wanted.push((sandbox.as_str(), "Agent sandbox"));
     }
 
@@ -233,10 +231,44 @@ fn ensure_images(app: &AppHandle, state: &Launcher, force: bool) -> Result<(), S
         })?;
     }
 
-    // Point the name the server looks for at whatever was just pulled. Done
-    // unconditionally so an update repoints the tag as well.
-    docker::tag(&sandbox, config::SANDBOX_LOCAL_TAG)?;
+    drop_legacy_sandbox_tag();
+    record_image_identity(&server, if steps > 0 { "pulled" } else { "already present" });
     Ok(())
+}
+
+/// Removes the second name earlier versions gave the sandbox image.
+///
+/// They pulled `omaraflak/kayak-sandbox` and then tagged it `kayak-sandbox`,
+/// because the server defaulted to the unqualified name. That is one image with
+/// two tags rather than two images, but `docker images` lists it twice and it
+/// reads as Kayak having installed the same thing twice. The server is told the
+/// published name directly now, so the extra tag has no purpose.
+///
+/// Failure is ignored: the tag is absent on a fresh install, and a machine that
+/// still has a container referencing it is one where removing it would be wrong
+/// anyway.
+fn drop_legacy_sandbox_tag() {
+    if docker::has_image(config::LEGACY_SANDBOX_TAG) {
+        let _ = docker::remove_image(config::LEGACY_SANDBOX_TAG);
+        logs::record("image", "removed the duplicate kayak-sandbox tag");
+    }
+}
+
+/// Records exactly which image the launcher ended up with.
+///
+/// Without this a report of "it is still the old version" cannot be told apart
+/// from "the tag did not move", "the pull was served something stale", or "the
+/// launcher never pulled at all" -- the three have the same symptom and
+/// completely different causes. The digest identifies the image regardless of
+/// what the tag currently points at.
+fn record_image_identity(image: &str, how: &str) {
+    let version = docker::image_version(image).unwrap_or_else(|| "unlabelled".to_string());
+    let digest = docker::image_digest(image).unwrap_or_else(|| "no repository digest".to_string());
+    let id = docker::image_id(image).unwrap_or_else(|| "unknown".to_string());
+    logs::record(
+        "image",
+        &format!("{image} {how}: version {version}, digest {digest}, id {id}"),
+    );
 }
 
 /// Brings Kayak up, from a cold machine to a served UI.
@@ -331,20 +363,40 @@ fn boot(app: AppHandle, state: Arc<Launcher>) {
 fn start_server(app: &AppHandle, state: &Launcher) -> Result<(), String> {
     let data_dir = paths::ensure_data_dir()?;
 
-    // A container left running by a previous launch is reused as-is: recreating
-    // it would drop whatever agents are mid-run inside it.
+    // A container left running by a previous launch is reused, because
+    // recreating it would drop whatever agents are mid-run inside it -- but only
+    // when it came from the image that is current now.
     if docker::container_state(config::CONTAINER_NAME) == docker::ContainerState::Running {
-        if let Some(port) = docker::published_port(config::CONTAINER_NAME) {
-            set_stage(
-                app,
-                state,
-                Stage::Starting {
-                    detail: "Reconnecting to Kayak".to_string(),
-                },
+        let running_from = docker::container_image_id(config::CONTAINER_NAME);
+        let current = docker::image_id(&config::server_image());
+
+        logs::record(
+            "boot",
+            &format!(
+                "a container is already running (built from {}, current image is {})",
+                running_from.as_deref().unwrap_or("unknown"),
+                current.as_deref().unwrap_or("absent"),
+            ),
+        );
+
+        if should_reuse(running_from.as_deref(), current.as_deref()) {
+            if let Some(port) = docker::published_port(config::CONTAINER_NAME) {
+                set_stage(
+                    app,
+                    state,
+                    Stage::Starting {
+                        detail: "Reconnecting to Kayak".to_string(),
+                    },
+                );
+                wait_for_health(port, Duration::from_secs(config::HEALTH_TIMEOUT_SECS))?;
+                *state.port.lock().unwrap() = Some(port);
+                return Ok(());
+            }
+        } else {
+            logs::record(
+                "boot",
+                "the running container was built from an older image; replacing it",
             );
-            wait_for_health(port, Duration::from_secs(config::HEALTH_TIMEOUT_SECS))?;
-            *state.port.lock().unwrap() = Some(port);
-            return Ok(());
         }
     }
 
@@ -373,10 +425,12 @@ fn start_server(app: &AppHandle, state: &Launcher) -> Result<(), String> {
         },
     );
 
-    // A stopped container may have been created with a port that is now taken,
-    // or from an image that has since been replaced, so it is rebuilt rather
-    // than restarted. All state lives in the mounted data directory, so nothing
-    // is lost by doing so.
+    // A container may have been created with a port that is now taken, or from
+    // an image that has since been replaced, so it is rebuilt rather than
+    // restarted. All state lives in the mounted data directory, so nothing is
+    // lost by doing so -- provided it is stopped rather than killed, since the
+    // server owns a SQLite database.
+    docker::stop_container(config::CONTAINER_NAME)?;
     docker::remove_container(config::CONTAINER_NAME)?;
 
     let port = docker::find_free_port(config::PREFERRED_PORT, config::PORT_SCAN_RANGE)?;
@@ -390,6 +444,24 @@ fn start_server(app: &AppHandle, state: &Launcher) -> Result<(), String> {
     wait_for_health(port, Duration::from_secs(config::HEALTH_TIMEOUT_SECS))?;
     *state.port.lock().unwrap() = Some(port);
     Ok(())
+}
+
+/// Decides whether a running container can serve the current image.
+///
+/// A container records the image ID it was created from, not the tag, so a tag
+/// that has since moved leaves the two different. Without this check the
+/// launcher reused whatever was already running forever: the container kept the
+/// old image alive, Docker then refused to delete that image because a container
+/// referenced it, and a user who deleted everything and started again was handed
+/// the same old version with nothing to explain why.
+///
+/// Reuse only on a definite match. An unknown ID on either side means the safe
+/// answer is to rebuild, which costs a few seconds.
+fn should_reuse(container_image: Option<&str>, current_image: Option<&str>) -> bool {
+    match (container_image, current_image) {
+        (Some(running), Some(current)) => running == current,
+        _ => false,
+    }
 }
 
 /// Opens (or focuses) the window that shows Kayak itself.
@@ -730,8 +802,16 @@ fn check_for_updates(app: AppHandle, state: Arc<Launcher>) {
             .map(registry::short_digest)
     });
     let result = registry::latest_tag(config::SERVER_REPO, config::TAG);
-    if let Err(error) = result.as_ref() {
-        logs::record("update", &format!("could not reach Docker Hub: {error}"));
+    match result.as_ref() {
+        Err(error) => logs::record("update", &format!("could not reach Docker Hub: {error}")),
+        Ok(remote) => logs::record(
+            "update",
+            &format!(
+                "docker hub publishes {}; installed digest is {}",
+                remote.digest,
+                installed.as_deref().unwrap_or("none"),
+            ),
+        ),
     }
 
     let info = match result {
@@ -896,7 +976,7 @@ fn ensure_images_for_update(app: &AppHandle, force: bool) -> Result<(), String> 
         })?;
     }
 
-    docker::tag(&sandbox, config::SANDBOX_LOCAL_TAG)?;
+    drop_legacy_sandbox_tag();
     Ok(())
 }
 
@@ -1242,3 +1322,27 @@ pub fn run() {
         });
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::should_reuse;
+
+    #[test]
+    fn reuses_a_container_from_the_current_image() {
+        assert!(should_reuse(Some("sha256:aaa"), Some("sha256:aaa")));
+    }
+
+    #[test]
+    fn replaces_a_container_from_an_older_image() {
+        // The case that pinned users to an old version: the tag moved, but the
+        // container still referenced what it was built from.
+        assert!(!should_reuse(Some("sha256:old"), Some("sha256:new")));
+    }
+
+    #[test]
+    fn rebuilds_when_either_side_is_unknown() {
+        assert!(!should_reuse(None, Some("sha256:aaa")));
+        assert!(!should_reuse(Some("sha256:aaa"), None));
+        assert!(!should_reuse(None, None));
+    }
+}
