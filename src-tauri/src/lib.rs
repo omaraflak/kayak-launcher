@@ -8,6 +8,7 @@
 mod config;
 mod control;
 mod docker;
+mod logs;
 mod metal;
 mod paths;
 mod registry;
@@ -96,6 +97,10 @@ pub struct Launcher {
     /// The Metal inference server, when one is running. Native to the host
     /// rather than containerised, because Metal has no passthrough into Docker.
     metal: Mutex<Option<metal::Server>>,
+    /// The model whose Metal server failed, and why. Held so the reconcile
+    /// loop reports the failure instead of respawning a server that has already
+    /// proved it cannot start.
+    metal_failure: Mutex<Option<(String, String)>>,
     /// A launcher update waiting to be installed, held so the button in the
     /// Kayak window can apply the one already found rather than checking again.
     launcher_update: Mutex<Option<tauri_plugin_updater::Update>>,
@@ -114,6 +119,7 @@ impl Launcher {
             update: Mutex::new(UpdateInfo::default()),
             port: Mutex::new(None),
             metal: Mutex::new(None),
+            metal_failure: Mutex::new(None),
             launcher_update: Mutex::new(None),
             shutting_down: AtomicBool::new(false),
             busy: AtomicBool::new(false),
@@ -239,9 +245,11 @@ fn boot(app: AppHandle, state: Arc<Launcher>) {
         return;
     };
 
+    logs::record("boot", "starting up");
     set_stage(&app, &state, Stage::Checking);
 
     if !docker::is_installed() {
+        logs::record("boot", "docker CLI not found on this machine");
         set_stage(
             &app,
             &state,
@@ -253,6 +261,7 @@ fn boot(app: AppHandle, state: Arc<Launcher>) {
     }
 
     if !docker::is_daemon_running() {
+        logs::record("boot", "docker CLI found but the daemon is not answering");
         set_stage(
             &app,
             &state,
@@ -264,6 +273,7 @@ fn boot(app: AppHandle, state: Arc<Launcher>) {
     }
 
     if let Err(error) = start_server(&app, &state) {
+        logs::record("boot", &format!("kayak could not be started: {error}"));
         set_stage(
             &app,
             &state,
@@ -277,6 +287,7 @@ fn boot(app: AppHandle, state: Arc<Launcher>) {
 
     let port = state.port.lock().unwrap().unwrap_or(config::PREFERRED_PORT);
     let url = format!("http://127.0.0.1:{port}");
+    logs::record("boot", &format!("kayak is serving on {url}"));
     set_stage(&app, &state, Stage::Ready { url: url.clone() });
 
     if let Err(error) = show_kayak(&app, &url) {
@@ -300,6 +311,16 @@ fn boot(app: AppHandle, state: Arc<Launcher>) {
     // Started only once Kayak is serving: the control channel lives in the
     // data directory, which is not seeded until the container has run.
     if let Ok(data_dir) = paths::ensure_data_dir() {
+        let control = control::ControlPaths::under(&data_dir);
+        let _ = std::fs::create_dir_all(&control.dir);
+        // Mirrored into the directory Kayak already shares, which is how a
+        // support dump assembled inside the container can include host-side
+        // records it could not otherwise see.
+        logs::mirror_to(&control.dir.join("launcher.log"));
+        logs::record(
+            "boot",
+            &format!("launcher {} on {}", env!("CARGO_PKG_VERSION"), std::env::consts::OS),
+        );
         spawn_metal_reconciler(state.clone(), data_dir);
     }
 
@@ -340,6 +361,7 @@ fn start_server(app: &AppHandle, state: &Launcher) -> Result<(), String> {
                 detail: "Setting up your workspace".to_string(),
             },
         );
+        logs::record("boot", "seeding the data directory from the image");
         docker::copy_out_of_image(&config::server_image(), "/app/data", &data_dir)?;
     }
 
@@ -603,6 +625,7 @@ fn begin_shutdown(app: AppHandle, state: Arc<Launcher>) {
     if state.shutting_down.swap(true, Ordering::SeqCst) {
         return;
     }
+    logs::record("shutdown", "stopping the container and any GPU server");
     eval_in_kayak(&app, "window.__kayakLauncher && window.__kayakLauncher.showShutdown()");
 
     thread::spawn(move || {
@@ -659,6 +682,9 @@ fn check_for_updates(app: AppHandle, state: Arc<Launcher>) {
             .map(registry::short_digest)
     });
     let result = registry::latest_tag(config::SERVER_REPO, config::TAG);
+    if let Err(error) = result.as_ref() {
+        logs::record("update", &format!("could not reach Docker Hub: {error}"));
+    }
 
     let info = match result {
         Err(error) => UpdateInfo {
@@ -716,6 +742,7 @@ fn apply_update(app: AppHandle, state: Arc<Launcher>) {
         return;
     };
 
+    logs::record("update", "applying a Kayak update");
     show_banner_progress(&app, "Downloading the new version", -1);
 
     // Noted before the pull: repointing a tag leaves the image it replaced
@@ -789,6 +816,7 @@ fn apply_update(app: AppHandle, state: Arc<Launcher>) {
             }
         }
         Err(error) => {
+            logs::record("update", &format!("update failed: {error}"));
             eval_in_kayak(
                 &app,
                 &format!(
@@ -830,25 +858,55 @@ fn ensure_images_for_update(app: &AppHandle, force: bool) -> Result<(), String> 
 /// reaches either backend through the one `VLLM_API_BASE` it already has.
 const METAL_PORT: u16 = 8001;
 
+/// Writes the status file, always carrying the current versions with it.
+///
+/// Kayak displays both, and it can read neither on its own: the launcher is a
+/// separate program, and the server's version is a label on the image it runs
+/// from, which is not visible from inside that image.
+fn write_status_with_versions(
+    state: &Launcher,
+    paths: &control::ControlPaths,
+    metal: control::MetalStatus,
+) {
+    let versions = control::Versions {
+        launcher: env!("CARGO_PKG_VERSION").to_string(),
+        kayak: state.update.lock().unwrap().installed.clone(),
+    };
+    let _ = control::write_status(&paths.status, &control::Status { metal, versions });
+}
+
 /// Drives the Metal server towards whatever Kayak has asked for.
 ///
 /// Runs on its own thread and is allowed to block: installing the environment
 /// downloads gigabytes and takes minutes, and doing that inline keeps the whole
 /// sequence in one place instead of spread across a state machine.
 fn reconcile_metal(state: &Launcher, paths: &control::ControlPaths) {
-    let supported = metal::is_apple_silicon();
+    let silicon = metal::detect_silicon();
+    let supported = silicon == metal::Silicon::Native;
     let mut status = control::MetalStatus {
         supported,
         installed: metal::is_installed(),
         state: "stopped".to_string(),
         port: METAL_PORT,
+        detail: match silicon {
+            // Worth saying out loud: the machine can serve Metal, and the only
+            // thing stopping it is which build of the launcher is installed.
+            // Silently reporting "unsupported" here is what hid GPU inference
+            // from the users who actually had the hardware.
+            metal::Silicon::Translated => Some(
+                "This is the Intel build of the Kayak app running under Rosetta. \
+                 Download the Apple Silicon build to use the GPU."
+                    .to_string(),
+            ),
+            _ => None,
+        },
         ..Default::default()
     };
 
     if !supported {
         // Nothing else can be true on this machine, and saying so lets Kayak
         // hide the option rather than offer something that cannot work.
-        let _ = control::write_status(&paths.status, &control::Status { metal: status });
+        write_status_with_versions(state, paths, status);
         return;
     }
 
@@ -873,41 +931,77 @@ fn reconcile_metal(state: &Launcher, paths: &control::ControlPaths) {
             );
             status.state = "error".to_string();
         }
-        let _ = control::write_status(&paths.status, &control::Status { metal: status });
+        write_status_with_versions(state, paths, status);
         return;
     };
+
+    // A failure is remembered per model. Without this the loop notices the dead
+    // process, starts another, and repeats every two seconds -- burning the
+    // machine and never reporting why the first one died.
+    {
+        let failure = state.metal_failure.lock().unwrap();
+        if let Some((failed_model, reason)) = failure.as_ref() {
+            if failed_model == &model {
+                status.model = Some(model);
+                status.state = "error".to_string();
+                status.error = Some(reason.clone());
+                write_status_with_versions(state, paths, status);
+                return;
+            }
+        }
+    }
 
     // A server already serving the right model just needs its health reported.
     {
         let mut running = state.metal.lock().unwrap();
         if let Some(server) = running.as_mut() {
-            if server.model == model && server.is_alive() {
-                status.model = Some(model);
-                status.state = if metal::is_healthy(METAL_PORT) {
-                    "ready"
-                } else {
-                    "starting"
+            if server.model == model {
+                if server.is_alive() {
+                    let healthy = metal::is_healthy(METAL_PORT);
+                    status.model = Some(model);
+                    status.state = if healthy { "ready" } else { "starting" }.to_string();
+                    write_status_with_versions(state, paths, status);
+                    return;
                 }
-                .to_string();
-                let _ = control::write_status(&paths.status, &control::Status { metal: status });
+
+                // Exited on its own. Its output is the only account of why, so
+                // it is carried into the status rather than left in the log.
+                let tail = logs::tail(15).join("\n");
+                logs::record("metal", "server exited before becoming healthy");
+                let reason = if tail.is_empty() {
+                    "The GPU server stopped unexpectedly.".to_string()
+                } else {
+                    format!("The GPU server stopped unexpectedly:\n{tail}")
+                };
+                *state.metal_failure.lock().unwrap() = Some((model.clone(), reason.clone()));
+                running.take();
+
+                status.model = Some(model);
+                status.state = "error".to_string();
+                status.error = Some(reason);
+                write_status_with_versions(state, paths, status);
                 return;
             }
         }
-        // Wrong model, or the process died on its own.
+        // A different model was asked for, so whatever is running makes way.
         if let Some(server) = running.take() {
             server.stop();
         }
+        *state.metal_failure.lock().unwrap() = None;
     }
 
     if !metal::is_installed() {
         status.state = "installing".to_string();
         status.model = Some(model.clone());
-        let _ = control::write_status(&paths.status, &control::Status { metal: status.clone() });
+        write_status_with_versions(state, paths, status.clone());
 
+        logs::record("metal", "installing the vllm-metal environment");
         if let Err(error) = metal::run_install(|_| {}) {
+            logs::record("metal", &format!("install failed: {error}"));
+            *state.metal_failure.lock().unwrap() = Some((model.clone(), error.clone()));
             status.state = "error".to_string();
             status.error = Some(error);
-            let _ = control::write_status(&paths.status, &control::Status { metal: status });
+            write_status_with_versions(state, paths, status);
             return;
         }
         status.installed = true;
@@ -920,11 +1014,13 @@ fn reconcile_metal(state: &Launcher, paths: &control::ControlPaths) {
             status.model = Some(model);
         }
         Err(error) => {
+            logs::record("metal", &format!("could not start: {error}"));
+            *state.metal_failure.lock().unwrap() = Some((model, error.clone()));
             status.state = "error".to_string();
             status.error = Some(error);
         }
     }
-    let _ = control::write_status(&paths.status, &control::Status { metal: status });
+    write_status_with_versions(state, paths, status);
 }
 
 /// Polls the control channel for as long as the app runs.

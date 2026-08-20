@@ -22,27 +22,61 @@ const INSTALL_SCRIPT_URL: &str =
 /// Where `install.sh` places the virtualenv when run without a checkout.
 const VENV_DIR: &str = ".venv-vllm-metal";
 
-/// Reports whether this machine has an Apple Silicon CPU.
-///
-/// Deliberately a runtime probe rather than `cfg!(target_arch)`. The launcher
-/// ships separate Intel and Apple Silicon builds, and an Intel build run under
-/// Rosetta on an M-series Mac would compile-time report x86_64 while sitting on
-/// hardware that can serve Metal perfectly well. `hw.optional.arm64` describes
-/// the CPU, not the process, so it stays correct either way.
-pub fn is_apple_silicon() -> bool {
-    if !cfg!(target_os = "macos") {
-        return false;
-    }
-    let Ok(output) = Command::new("/usr/sbin/sysctl")
-        .args(["-n", "hw.optional.arm64"])
+/// What this machine and this process can do about Metal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Silicon {
+    /// Apple Silicon, running natively. Metal inference can work here.
+    Native,
+    /// Apple Silicon hardware, but this process is x86 under Rosetta.
+    ///
+    /// Kept distinct from `Native` because vllm-metal needs a native arm64
+    /// Python and its installer refuses outright when `uname -m` reports
+    /// x86_64. The hardware is capable; this build of the launcher is not.
+    Translated,
+    /// Not Apple Silicon.
+    None,
+}
+
+/// Reads a sysctl value, or `None` when the key does not exist.
+fn sysctl(key: &str) -> Option<String> {
+    let output = Command::new("/usr/sbin/sysctl")
+        .args(["-n", key])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .output()
-    else {
-        return false;
-    };
-    // The key is absent entirely on Intel, so a failed lookup means "no".
-    output.status.success() && String::from_utf8_lossy(&output.stdout).trim() == "1"
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Works out whether Metal inference is possible on this machine.
+///
+/// Three signals rather than one, because the obvious check is wrong in the
+/// case that matters most. Rosetta presents a translated process with an x86
+/// machine, masking `hw.optional.arm64`, so the Intel build of this launcher
+/// running on an Apple Silicon Mac reported "not Apple Silicon" and hid GPU
+/// support from exactly the users who had the hardware for it.
+///
+/// `sysctl.proc_translated` exists only inside a translated process, so its
+/// presence is itself proof the host is Apple Silicon, and the CPU brand string
+/// is a further fallback for either case.
+pub fn detect_silicon() -> Silicon {
+    if !cfg!(target_os = "macos") {
+        return Silicon::None;
+    }
+
+    let translated = sysctl("sysctl.proc_translated").as_deref() == Some("1");
+    let native_arm = sysctl("hw.optional.arm64").as_deref() == Some("1");
+    let apple_cpu = sysctl("machdep.cpu.brand_string")
+        .is_some_and(|brand| brand.starts_with("Apple"));
+
+    match (translated, native_arm || apple_cpu) {
+        (true, _) => Silicon::Translated,
+        (false, true) => Silicon::Native,
+        (false, false) => Silicon::None,
+    }
 }
 
 /// Virtualenv the Metal server runs from.
@@ -60,6 +94,35 @@ pub fn is_installed() -> bool {
     cli_path().is_some_and(|cli| cli.is_file())
 }
 
+
+/// Directories the installer and the server need on their PATH.
+///
+/// The upstream installer provisions `uv` into the user's home and then invokes
+/// it by name, and the virtualenv's `vllm` shells out to tools of its own. An
+/// app opened from Finder inherits `/usr/bin:/bin:/usr/sbin:/sbin` and none of
+/// those locations, so the install fails the moment it tries to run what it
+/// just installed. This is the same environment gap that made the Docker CLI
+/// and its credential helper unreachable.
+fn tool_search_path() -> std::ffi::OsString {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    if let Some(home) = dirs::home_dir() {
+        // Where uv installs itself, in preference order.
+        dirs.push(home.join(".local").join("bin"));
+        dirs.push(home.join(".cargo").join("bin"));
+        dirs.push(home.join(VENV_DIR).join("bin"));
+    }
+    dirs.push(PathBuf::from("/opt/homebrew/bin"));
+    dirs.push(PathBuf::from("/usr/local/bin"));
+
+    if let Some(inherited) = std::env::var_os("PATH") {
+        dirs.extend(std::env::split_paths(&inherited));
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    dirs.retain(|dir| !dir.as_os_str().is_empty() && seen.insert(dir.clone()));
+    std::env::join_paths(dirs).unwrap_or_else(|_| std::env::var_os("PATH").unwrap_or_default())
+}
+
 /// Builds the command that installs the Metal environment.
 ///
 /// Piping a remote script into a shell is the installation path upstream
@@ -67,6 +130,7 @@ pub fn is_installed() -> bool {
 /// diverge from the wheel versions it resolves.
 pub fn install_command() -> Command {
     let mut command = Command::new("/bin/bash");
+    command.env("PATH", tool_search_path());
     command.arg("-c").arg(format!(
         "curl -fsSL {INSTALL_SCRIPT_URL} | bash"
     ));
@@ -154,6 +218,7 @@ where
 
     if let Some(stdout) = child.stdout.take() {
         for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            crate::logs::record("metal-install", &line);
             on_line(&line);
         }
     }
@@ -174,6 +239,22 @@ where
     })
 }
 
+
+/// Reads a child stream to exhaustion on its own thread, recording each line.
+///
+/// Returning immediately is the point: the reader outlives this call and keeps
+/// the pipe drained until the process closes it.
+fn drain<R: std::io::Read + Send + 'static>(stream: Option<R>, source: &'static str) {
+    let Some(stream) = stream else {
+        return;
+    };
+    std::thread::spawn(move || {
+        for line in BufReader::new(stream).lines().map_while(Result::ok) {
+            crate::logs::record(source, &line);
+        }
+    });
+}
+
 /// Starts the Metal inference server for a model.
 pub fn spawn_server(model: &str, port: u16) -> Result<Server, String> {
     let cli = cli_path().ok_or_else(|| "Could not locate the vllm-metal CLI".to_string())?;
@@ -181,8 +262,11 @@ pub fn spawn_server(model: &str, port: u16) -> Result<Server, String> {
         return Err("The vllm-metal environment is not installed".to_string());
     }
 
-    let child = Command::new(&cli)
+    crate::logs::record("metal", &format!("starting {model} on port {port}"));
+
+    let mut child = Command::new(&cli)
         .args(serve_args(model, port))
+        .env("PATH", tool_search_path())
         // Weights land in the Hugging Face cache, which lives in the user's
         // home directory rather than Kayak's data directory, because the Metal
         // server runs on the host and shares nothing with the container.
@@ -190,6 +274,13 @@ pub fn spawn_server(model: &str, port: u16) -> Result<Server, String> {
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| format!("Could not start the Metal server: {err}"))?;
+
+    // Both streams must be read for the lifetime of the process, not merely
+    // captured. vLLM writes steadily while it loads a model, and a pipe nothing
+    // drains fills after about 64KB, at which point the server blocks on its own
+    // logging and never finishes starting -- with no output to explain why.
+    drain(child.stdout.take(), "metal");
+    drain(child.stderr.take(), "metal");
 
     Ok(Server {
         child,
@@ -243,17 +334,21 @@ mod tests {
     }
 
     #[test]
-    fn intel_hardware_is_not_apple_silicon() {
-        // Guards the probe against silently reporting true everywhere, which
-        // would offer Metal on machines that cannot run it.
-        if std::process::Command::new("/usr/bin/uname")
-            .arg("-m")
-            .output()
-            .map(|out| String::from_utf8_lossy(&out.stdout).trim() == "x86_64")
-            .unwrap_or(false)
-            && !std::path::Path::new("/usr/libexec/rosetta").exists()
+    fn intel_hardware_reports_no_silicon() {
+        // Guards against the probe reporting Native everywhere, which would
+        // offer GPU inference on machines that cannot run it.
+        if sysctl("machdep.cpu.brand_string").is_some_and(|b| b.starts_with("Intel"))
+            && sysctl("sysctl.proc_translated").is_none()
         {
-            assert!(!is_apple_silicon());
+            assert_eq!(detect_silicon(), Silicon::None);
         }
+    }
+
+    #[test]
+    fn translated_is_not_treated_as_native() {
+        // The distinction is the whole point: the hardware can serve Metal but
+        // this process cannot, and the two need different messages.
+        assert_ne!(Silicon::Translated, Silicon::Native);
+        assert!(matches!(detect_silicon(), Silicon::Native | Silicon::Translated | Silicon::None));
     }
 }

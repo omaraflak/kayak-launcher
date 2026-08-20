@@ -43,6 +43,18 @@ pub struct MetalDesired {
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
 pub struct Status {
     pub metal: MetalStatus,
+    pub versions: Versions,
+}
+
+/// What is installed, on both sides of the container boundary.
+///
+/// Kayak cannot read either of these itself: the launcher's version is a
+/// different program, and the server's version is a label on the image it is
+/// running from, which is not visible from inside that image.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct Versions {
+    pub launcher: String,
+    pub kayak: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
@@ -56,6 +68,9 @@ pub struct MetalStatus {
     pub model: Option<String>,
     pub port: u16,
     pub error: Option<String>,
+    /// Why Metal is unavailable, when the hardware could otherwise do it.
+    /// Distinct from `error`, which describes a start that was attempted.
+    pub detail: Option<String>,
 }
 
 /// Locations of the two channel files inside a data directory.
@@ -184,6 +199,11 @@ mod tests {
                 model: Some("mlx-community/X".to_string()),
                 port: 8001,
                 error: None,
+                detail: None,
+            },
+            versions: Versions {
+                launcher: "1.2.3".to_string(),
+                kayak: Some("4.5.6".to_string()),
             },
         };
         write_status(&path, &status).unwrap();
@@ -191,6 +211,10 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.contains("\"ready\""));
         assert!(raw.contains("8001"));
+        // Both versions travel with every status write, because Kayak can read
+        // neither of them on its own.
+        assert!(raw.contains("1.2.3"));
+        assert!(raw.contains("4.5.6"));
         // The temporary file must not survive the rename.
         assert!(!dir.join("status.json.tmp").exists());
         std::fs::remove_dir_all(&dir).ok();
