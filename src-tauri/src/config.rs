@@ -9,10 +9,14 @@ pub const SANDBOX_REPO: &str = "omaraflak/kayak-sandbox";
 /// Tag both repositories are published under.
 pub const TAG: &str = "latest";
 
-/// The server reads `KAYAK_SANDBOX_IMAGE` to decide which image to start
-/// sandboxes from, and defaults to this unqualified name. The pulled sandbox
-/// image is retagged to it so the server finds it without extra configuration.
-pub const SANDBOX_LOCAL_TAG: &str = "kayak-sandbox:latest";
+/// Name the server defaults to for sandboxes when nothing tells it otherwise.
+///
+/// The launcher does tell it otherwise, passing the published repository, and
+/// this exists only to clean up after earlier versions: those pulled the
+/// published image and then tagged it with this name, which left `docker images`
+/// showing two entries for one image and made it look as though Kayak had
+/// installed something twice.
+pub const LEGACY_SANDBOX_TAG: &str = "kayak-sandbox:latest";
 
 /// Name of the container the launcher owns. A fixed name is what lets a second
 /// launch reattach to an already-running Kayak instead of starting a duplicate.

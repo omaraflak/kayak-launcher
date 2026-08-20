@@ -457,11 +457,6 @@ pub fn absorb_line(line: &str, layers: &mut HashMap<String, String>) -> Option<P
     Some(PullProgress { done, total })
 }
 
-/// Points a second tag at an existing image.
-pub fn tag(source: &str, target: &str) -> Result<(), String> {
-    run(&["tag", source, target]).map(|_| ())
-}
-
 /// Copies a directory out of an image onto the host.
 ///
 /// Used to seed the data directory. The image ships default agents, skills and
@@ -497,6 +492,15 @@ pub fn container_state(name: &str) -> ContainerState {
         Ok(status) if status == "running" => ContainerState::Running,
         Ok(_) => ContainerState::Stopped,
     }
+}
+
+/// Returns the image ID a container was created from.
+///
+/// Compared against the current image ID to notice a container that predates an
+/// update. Docker records the resolved ID, so this stays correct even though the
+/// container was created from a moving tag.
+pub fn container_image_id(name: &str) -> Option<String> {
+    run(&["inspect", "--format", "{{.Image}}", name]).ok()
 }
 
 /// Returns the host port a running container publishes its server port on.
@@ -564,7 +568,9 @@ pub fn run_container(spec: &RunSpec) -> Result<(), String> {
         "KAYAK_CORS_ORIGINS=http://127.0.0.1:{port},http://localhost:{port}",
         port = spec.port
     );
-    let sandbox = format!("KAYAK_SANDBOX_IMAGE={}", crate::config::SANDBOX_LOCAL_TAG);
+    // The published repository, so the server starts sandboxes from the same
+    // image the launcher pulled rather than from a second name for it.
+    let sandbox = format!("KAYAK_SANDBOX_IMAGE={}", crate::config::sandbox_image());
     // Sandboxes are siblings on the host daemon, so paths the server asks it to
     // mount have to be host paths. Inside the container it only knows
     // `/app/data`, so the host equivalent is passed in explicitly.
