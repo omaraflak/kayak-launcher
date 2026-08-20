@@ -265,7 +265,48 @@
     host.appendChild(box);
   };
 
+  /**
+   * Sends links that have nowhere to go in this window to the system instead.
+   *
+   * A Tauri webview has no tabs, so `target="_blank"` opens nothing at all, and
+   * it cannot render a `mailto:` either -- both simply do nothing when clicked,
+   * with no error. Kayak is served from a container and has no idea it is being
+   * displayed in an app rather than a browser, so the interception belongs here
+   * rather than in its markup.
+   *
+   * Captured rather than bubbled so it still applies when the page stops
+   * propagation of its own clicks.
+   */
+  function interceptLinks(event) {
+    var anchor = event.target && event.target.closest && event.target.closest("a[href]");
+    if (!anchor || !isExternal(anchor)) return;
+
+    event.preventDefault();
+    event.stopPropagation();
+    api.openExternal(anchor.href);
+  }
+
+  /** Reports whether a link would go nowhere if this window handled it. */
+  function isExternal(anchor) {
+    var href = anchor.getAttribute("href") || "";
+
+    // A scheme the webview cannot render, such as mailto: or tel:.
+    if (/^[a-z][a-z0-9+.-]*:/i.test(href) && !/^https?:/i.test(href)) return true;
+    // There are no tabs in this window, so a new one opens nothing.
+    if (anchor.target === "_blank") return true;
+    // Anywhere else would navigate away from Kayak with no way back.
+    return Boolean(anchor.origin) && anchor.origin !== window.location.origin;
+  }
+
+  /** Hands a URL to the operating system to open. */
+  api.openExternal = function (url) {
+    send("open?url=" + encodeURIComponent(url));
+  };
+
+
   api.hide = clear;
+
+  document.addEventListener("click", interceptLinks, true);
 
   window.__kayakLauncher = api;
 

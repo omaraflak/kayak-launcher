@@ -415,9 +415,23 @@ fn show_kayak(app: &AppHandle, url: &str) -> Result<(), String> {
         .initialization_script(BANNER_JS)
         .on_navigation(move |url| {
             let Some(action) = url.path().strip_prefix(ACTION_PREFIX) else {
+                // A scheme this window cannot render, such as mailto:. Kayak
+                // sets `location.href` for these, which is not a click and so
+                // never reaches the page's own link handling; left alone the
+                // webview simply refuses to go there and nothing happens.
+                if !matches!(url.scheme(), "http" | "https") {
+                    open_externally(&navigation_handle, url.as_str());
+                    return false;
+                }
                 return true;
             };
-            handle_banner_action(&navigation_handle, action.to_string());
+            // The query carries an argument for actions that need one, such as
+            // the URL to hand to the operating system.
+            let query: std::collections::HashMap<String, String> = url
+                .query_pairs()
+                .map(|(key, value)| (key.to_string(), value.to_string()))
+                .collect();
+            handle_banner_action(&navigation_handle, action.to_string(), query);
             // Cancelled: these paths are a message channel, not a real page.
             false
         })
@@ -637,8 +651,37 @@ fn begin_shutdown(app: AppHandle, state: Arc<Launcher>) {
     });
 }
 
+/// Schemes the launcher is willing to hand to the operating system.
+///
+/// An allow-list rather than a block-list. The page asking for this is served
+/// from the container, where an agent can influence what ends up on it, so a
+/// `file:` or a shell-adjacent scheme arriving here must not be honoured.
+const OPENABLE_SCHEMES: [&str; 3] = ["http", "https", "mailto"];
+
+/// Opens a URL in whatever the operating system uses for it.
+fn open_externally(app: &AppHandle, target: &str) {
+    let scheme = target
+        .split_once(':')
+        .map(|(scheme, _)| scheme.to_ascii_lowercase())
+        .unwrap_or_default();
+
+    if !OPENABLE_SCHEMES.contains(&scheme.as_str()) {
+        logs::record("open", &format!("refused to open a {scheme} url"));
+        return;
+    }
+
+    logs::record("open", &format!("opening {scheme} link externally"));
+    if let Err(error) = tauri_plugin_opener::OpenerExt::opener(app).open_url(target, None::<&str>) {
+        logs::record("open", &format!("could not open the link: {error}"));
+    }
+}
+
 /// Responds to a button press in the injected banner.
-fn handle_banner_action(app: &AppHandle, action: String) {
+fn handle_banner_action(
+    app: &AppHandle,
+    action: String,
+    query: std::collections::HashMap<String, String>,
+) {
     let Some(state) = app.try_state::<Arc<Launcher>>() else {
         return;
     };
@@ -659,6 +702,11 @@ fn handle_banner_action(app: &AppHandle, action: String) {
         "dismiss" => {
             let mut update = state.update.lock().unwrap();
             update.available = false;
+        }
+        "open" => {
+            if let Some(target) = query.get("url") {
+                open_externally(app, target);
+            }
         }
         _ => {}
     }
@@ -1193,3 +1241,4 @@ pub fn run() {
             _ => {}
         });
 }
+
