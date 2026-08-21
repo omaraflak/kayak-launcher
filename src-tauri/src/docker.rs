@@ -526,12 +526,22 @@ pub fn remove_container(name: &str) -> Result<(), String> {
     run(&["rm", "--force", name]).map(|_| ())
 }
 
+/// How long the server is given to shut down before the daemon kills it.
+///
+/// Spelled out rather than left to the daemon because the daemon's own default
+/// is a local setting, and Docker Desktop has been seen using three seconds.
+/// Kayak stops its sandbox containers on the way down, which does not reliably
+/// fit in three seconds, and being killed part-way through leaves the sandboxes
+/// it had not reached still running. The call returns as soon as the container
+/// exits, so a generous limit costs nothing in the normal case.
+const STOP_GRACE_SECS: &str = "30";
+
 /// Stops a container without deleting it.
 pub fn stop_container(name: &str) -> Result<(), String> {
     if container_state(name) != ContainerState::Running {
         return Ok(());
     }
-    run(&["stop", name]).map(|_| ())
+    run(&["stop", "-t", STOP_GRACE_SECS, name]).map(|_| ())
 }
 
 /// Everything needed to start the Kayak server container.
