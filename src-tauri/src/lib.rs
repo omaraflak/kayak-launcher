@@ -718,6 +718,7 @@ fn begin_shutdown(app: AppHandle, state: Arc<Launcher>) {
         if let Some(server) = state.metal.lock().unwrap().take() {
             server.stop();
         }
+        write_stopped_status(&state);
         shutdown();
         app.exit(0);
     });
@@ -1039,6 +1040,9 @@ fn reconcile_metal(state: &Launcher, paths: &control::ControlPaths) {
     }
 
     let desired = control::read_desired(&paths.desired);
+    // Echoed on every write from here on, so Kayak can tell a status that
+    // answers its latest request from one describing the world before it.
+    status.request = desired.metal.request.clone();
     let wanted = desired
         .metal
         .running
@@ -1124,7 +1128,27 @@ fn reconcile_metal(state: &Launcher, paths: &control::ControlPaths) {
         write_status_with_versions(state, paths, status.clone());
 
         logs::record("metal", "installing the vllm-metal environment");
-        if let Err(error) = metal::run_install(|_| {}) {
+        // The install blocks this thread for minutes, and Kayak treats a
+        // status file nobody has touched recently as "no launcher running".
+        // A heartbeat keeps the file fresh for as long as the install runs.
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let result = std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let _ = sender.send(metal::run_install(|_| {}));
+            });
+            loop {
+                match receiver.recv_timeout(Duration::from_secs(2)) {
+                    Ok(result) => break result,
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        write_status_with_versions(state, paths, status.clone());
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        break Err("The vllm-metal installer stopped without reporting.".to_string());
+                    }
+                }
+            }
+        });
+        if let Err(error) = result {
             logs::record("metal", &format!("install failed: {error}"));
             *state.metal_failure.lock().unwrap() = Some((model.clone(), error.clone()));
             status.state = "error".to_string();
@@ -1152,15 +1176,40 @@ fn reconcile_metal(state: &Launcher, paths: &control::ControlPaths) {
 }
 
 /// Polls the control channel for as long as the app runs.
+///
+/// Stops reconciling the moment shutdown begins: the desired state still says
+/// "running" at that point, and one more pass would restart the server that
+/// shutdown just stopped — leaving an orphaned vLLM process behind when the
+/// launcher exits moments later.
 fn spawn_metal_reconciler(state: Arc<Launcher>, data_dir: std::path::PathBuf) {
     thread::spawn(move || {
         let paths = control::ControlPaths::under(&data_dir);
         let _ = std::fs::create_dir_all(&paths.dir);
-        loop {
+        while !state.shutting_down.load(Ordering::SeqCst) {
             reconcile_metal(&state, &paths);
             thread::sleep(Duration::from_secs(2));
         }
     });
+}
+
+/// Leaves the status file telling the truth once the Metal server is gone.
+///
+/// Without this, the last status written before quitting — often "ready" —
+/// sits on disk indefinitely, and a Kayak opened later reads it as a server
+/// that is up when nothing is listening at all.
+fn write_stopped_status(state: &Arc<Launcher>) {
+    let Ok(data_dir) = paths::ensure_data_dir() else {
+        return;
+    };
+    let paths = control::ControlPaths::under(&data_dir);
+    let status = control::MetalStatus {
+        supported: metal::detect_silicon() == metal::Silicon::Native,
+        installed: metal::is_installed(),
+        state: "stopped".to_string(),
+        port: METAL_PORT,
+        ..Default::default()
+    };
+    write_status_with_versions(state, &paths, status);
 }
 
 /// Stops the container the launcher started.
@@ -1315,6 +1364,7 @@ pub fn run() {
                     if let Some(server) = state.metal.lock().unwrap().take() {
                         server.stop();
                     }
+                    write_stopped_status(state.inner());
                 }
                 shutdown();
             }

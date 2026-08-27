@@ -137,10 +137,74 @@ pub fn install_command() -> Command {
     command
 }
 
+/// Which vLLM tool-call parser understands each model family's output format.
+///
+/// Ordered, first match wins, so more specific names must precede the family
+/// catch-all ("deepseek-v3.1" before "deepseek"). Matched against the
+/// lowercased model id. Parser names must exist in vLLM's registry
+/// (vllm/tool_parsers) — an unknown name stops the server from starting.
+///
+/// Kayak's backend carries the same table for the containerised path
+/// (`backend/app/vllm/manager.py`); the two must agree so a model behaves the
+/// same whichever backend serves it.
+const TOOL_PARSER_RULES: &[(&str, &str)] = &[
+    ("qwen3-coder", "qwen3_coder"),
+    ("gpt-oss", "openai"),
+    // R1 distills keep their base model's chat template, not DeepSeek's.
+    ("deepseek-r1-distill-llama", "llama3_json"),
+    ("deepseek-r1-distill", "hermes"),
+    ("deepseek-v3.2", "deepseek_v32"),
+    ("deepseek-v3.1", "deepseek_v31"),
+    ("deepseek-v4", "deepseek_v4"),
+    ("deepseek", "deepseek_v3"),
+    ("glm-4.7", "glm47"),
+    ("glm", "glm45"),
+    ("granite-20b-fc", "granite-20b-fc"),
+    ("granite-4", "granite4"),
+    ("granite", "granite"),
+    ("phi-4-mini", "phi4_mini_json"),
+    ("phi4-mini", "phi4_mini_json"),
+    ("internlm", "internlm"),
+    ("kimi-k3", "kimi_k3"),
+    ("kimi", "kimi_k2"),
+    ("llama-4", "llama4_pythonic"),
+    ("llama4", "llama4_pythonic"),
+    ("llama", "llama3_json"),
+    ("mistral", "mistral"),
+    ("jamba", "jamba"),
+    ("gemma-4", "gemma4"),
+    ("seed-oss", "seed_oss"),
+    ("hunyuan", "hunyuan_a13b"),
+    ("minimax-m3", "minimax_m3"),
+    ("minimax", "minimax_m2"),
+    ("ernie", "ernie45"),
+    ("olmo-3", "olmo3"),
+    ("olmo3", "olmo3"),
+];
+
+/// The vLLM tool-call parser for a model, by family.
+///
+/// Falls back to "hermes", which matches the format Qwen and most other open
+/// models emit. A mismatched parser does not crash the server; it just leaves
+/// tool calls unrecognised in the plain text of the reply.
+fn tool_call_parser(model: &str) -> &'static str {
+    let model = model.to_ascii_lowercase();
+    TOOL_PARSER_RULES
+        .iter()
+        .find(|(needle, _)| model.contains(needle))
+        .map(|(_, parser)| *parser)
+        .unwrap_or("hermes")
+}
+
 /// Arguments that start the OpenAI-compatible server for a model.
 ///
 /// Bound to loopback: this endpoint runs arbitrary generation on the user's
 /// machine and, unlike the containerised path, has no VM boundary around it.
+///
+/// Tool calling must be enabled explicitly: Kayak's agents attach tools to
+/// every chat request, and without these flags vLLM rejects such requests with
+/// a 400 ("auto" tool choice requires --enable-auto-tool-choice) the moment
+/// the user sends a message.
 pub fn serve_args(model: &str, port: u16) -> Vec<String> {
     vec![
         "serve".to_string(),
@@ -149,6 +213,9 @@ pub fn serve_args(model: &str, port: u16) -> Vec<String> {
         "127.0.0.1".to_string(),
         "--port".to_string(),
         port.to_string(),
+        "--enable-auto-tool-choice".to_string(),
+        "--tool-call-parser".to_string(),
+        tool_call_parser(model).to_string(),
     ]
 }
 
@@ -331,6 +398,64 @@ mod tests {
         // code-execution surface with no container around it.
         assert!(args.contains(&"127.0.0.1".to_string()));
         assert!(args.contains(&"8001".to_string()));
+    }
+
+    #[test]
+    fn serve_args_enable_tool_calling() {
+        // Kayak's agents send tools with every request; a server started
+        // without these flags 400s on the first message.
+        let args = serve_args("mlx-community/Qwen3-0.6B-4bit", 8001);
+
+        assert!(args.contains(&"--enable-auto-tool-choice".to_string()));
+        assert!(args.contains(&"--tool-call-parser".to_string()));
+        assert!(args.contains(&"hermes".to_string()));
+    }
+
+    #[test]
+    fn tool_call_parser_matches_model_family() {
+        assert_eq!(tool_call_parser("mlx-community/Qwen3-0.6B-4bit"), "hermes");
+        assert_eq!(
+            tool_call_parser("mlx-community/Llama-3.2-3B-Instruct-4bit"),
+            "llama3_json"
+        );
+        assert_eq!(
+            tool_call_parser("mlx-community/Mistral-7B-Instruct-v0.3-4bit"),
+            "mistral"
+        );
+        assert_eq!(
+            tool_call_parser("mlx-community/Qwen3-Coder-30B-A3B-Instruct-4bit"),
+            "qwen3_coder"
+        );
+        assert_eq!(tool_call_parser("mlx-community/gpt-oss-20b-MXFP4-Q8"), "openai");
+        assert_eq!(tool_call_parser("mlx-community/GLM-4.5-Air-4bit"), "glm45");
+        assert_eq!(
+            tool_call_parser("mlx-community/Phi-4-mini-instruct-4bit"),
+            "phi4_mini_json"
+        );
+        // Unknown families fall back to hermes rather than erroring.
+        assert_eq!(tool_call_parser("some-org/some-model"), "hermes");
+    }
+
+    #[test]
+    fn tool_call_parser_precedence_favours_specific_rules() {
+        // Llama 4 emits pythonic tool calls, not the Llama 3 JSON format.
+        assert_eq!(
+            tool_call_parser("mlx-community/Llama-4-Scout-17B-16E-Instruct-4bit"),
+            "llama4_pythonic"
+        );
+        assert_eq!(tool_call_parser("mlx-community/DeepSeek-V3-0324-4bit"), "deepseek_v3");
+        assert_eq!(tool_call_parser("deepseek-ai/DeepSeek-V3.1-Base"), "deepseek_v31");
+        // R1 distills keep the template of the model they were distilled into.
+        assert_eq!(
+            tool_call_parser("mlx-community/DeepSeek-R1-Distill-Qwen-7B-4bit"),
+            "hermes"
+        );
+        assert_eq!(
+            tool_call_parser("mlx-community/DeepSeek-R1-Distill-Llama-8B-4bit"),
+            "llama3_json"
+        );
+        assert_eq!(tool_call_parser("ibm-granite/granite-4.0-h-small"), "granite4");
+        assert_eq!(tool_call_parser("ibm-granite/granite-3.3-8b-instruct"), "granite");
     }
 
     #[test]

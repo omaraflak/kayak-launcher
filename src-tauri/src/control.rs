@@ -37,6 +37,11 @@ pub struct MetalDesired {
     pub running: bool,
     /// Model to serve. Ignored unless `running` is set.
     pub model: Option<String>,
+    /// Opaque token Kayak attaches to each start request. Echoed back in
+    /// `MetalStatus` so Kayak can tell a status that answers *this* request
+    /// from one written before the request existed — without the echo, a
+    /// stale "ready" from the previous server reads as instant success.
+    pub request: Option<String>,
 }
 
 /// What is actually true. Written by the launcher, read by the container.
@@ -71,6 +76,10 @@ pub struct MetalStatus {
     /// Why Metal is unavailable, when the hardware could otherwise do it.
     /// Distinct from `error`, which describes a start that was attempted.
     pub detail: Option<String>,
+    /// The `request` token from the desired state this status answers.
+    /// Always serialised, even when null: the key's presence is how Kayak
+    /// knows this launcher echoes requests at all.
+    pub request: Option<String>,
 }
 
 /// Locations of the two channel files inside a data directory.
@@ -200,6 +209,7 @@ mod tests {
                 port: 8001,
                 error: None,
                 detail: None,
+                request: None,
             },
             versions: Versions {
                 launcher: "1.2.3".to_string(),
@@ -217,6 +227,27 @@ mod tests {
         assert!(raw.contains("4.5.6"));
         // The temporary file must not survive the rename.
         assert!(!dir.join("status.json.tmp").exists());
+        // The request key must be present even when empty: its presence is
+        // how Kayak knows this launcher can echo requests.
+        assert!(raw.contains("\"request\""));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn desired_request_token_is_read() {
+        let dir = std::env::temp_dir().join("kayak-control-request");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("desired.json");
+        std::fs::write(
+            &path,
+            r#"{"metal":{"running":true,"model":"mlx-community/X","request":"abc123"}}"#,
+        )
+        .unwrap();
+
+        assert_eq!(read_desired(&path).metal.request.as_deref(), Some("abc123"));
+        // An older Kayak that sends no token must still be understood.
+        std::fs::write(&path, r#"{"metal":{"running":true,"model":"mlx-community/X"}}"#).unwrap();
+        assert_eq!(read_desired(&path).metal.request, None);
         std::fs::remove_dir_all(&dir).ok();
     }
 
