@@ -199,23 +199,15 @@ function renderUpdate(info: UpdateInfo): void {
   lastUpdate = info;
   footer.textContent = "";
 
-  // A pending launcher update takes precedence over a Kayak one: applying it
-  // restarts the app, which would interrupt a Kayak update mid-flight.
-  if (launcherUpdate) {
-    footer.appendChild(
-      element("span", undefined, `Launcher ${launcherUpdate} is available. `),
-    );
-    footer.appendChild(
-      button("Update and restart", () => void invoke("install_launcher_update")),
-    );
-    return;
-  }
-
   if (info.checking) {
     footer.textContent = "Checking for updates…";
     return;
   }
-  if (info.available) {
+  // One line and one button no matter what is out of date. The Kayak image
+  // and the launcher update through different channels, but that is plumbing:
+  // `install_update` applies everything that is pending, restarting the app
+  // if the launcher itself is part of it.
+  if (info.available || launcherUpdate !== null) {
     footer.appendChild(
       element(
         "span",

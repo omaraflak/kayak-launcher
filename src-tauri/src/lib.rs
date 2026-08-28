@@ -464,6 +464,26 @@ fn should_reuse(container_image: Option<&str>, current_image: Option<&str>) -> b
     }
 }
 
+/// A copy of `url` that no cache can already hold an entry for.
+///
+/// Navigations go through the webview's HTTP cache, and an index.html cached
+/// before Kayak sent cache headers stays "fresh" by heuristic for a long time
+/// -- long enough that opening or updating the app showed a previous release's
+/// UI without the webview ever asking the running server. A query string
+/// unique to this moment cannot match any stored entry, so the app shell is
+/// always fetched from the server that is actually running.
+fn cache_busted(url: &str) -> String {
+    // The counter makes consecutive calls distinct even within one clock
+    // millisecond, so no two navigations can ever share a cache entry.
+    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis())
+        .unwrap_or(0);
+    format!("{url}/?fresh={millis}-{sequence}")
+}
+
 /// Opens (or focuses) the window that shows Kayak itself.
 fn show_kayak(app: &AppHandle, url: &str) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(KAYAK_WINDOW) {
@@ -472,7 +492,7 @@ fn show_kayak(app: &AppHandle, url: &str) -> Result<(), String> {
         return Ok(());
     }
 
-    let parsed = url
+    let parsed = cache_busted(url)
         .parse()
         .map_err(|err| format!("Could not parse {url}: {err}"))?;
 
@@ -541,15 +561,6 @@ fn js_literal<T: Serialize>(value: &T) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
 }
 
-fn show_banner(app: &AppHandle, update: &UpdateInfo) {
-    eval_in_kayak(
-        app,
-        &format!(
-            "window.__kayakLauncher && window.__kayakLauncher.showUpdate({{date: {}}})",
-            js_literal(&update.date)
-        ),
-    );
-}
 
 fn show_banner_progress(app: &AppHandle, message: &str, percent: i32) {
     eval_in_kayak(
@@ -628,23 +639,23 @@ fn refresh_menu(app: &AppHandle, kayak_version: Option<&str>) {
 /// Called both when something changes and when the page announces itself, so a
 /// banner survives a reload and no longer depends on the webview happening to
 /// have a document at the moment a check finished.
+///
+/// One banner regardless of what is pending. Two things can be out of date —
+/// the Kayak image and this launcher — but that is plumbing the user should
+/// not have to know about: showing two different banners with two different
+/// buttons meant updating twice in a row. The single button applies both.
 fn push_banner_state(app: &AppHandle, state: &Launcher) {
-    // A launcher update wins when both are pending: installing it restarts the
-    // app, which would abandon a Kayak update halfway.
-    if let Some(update) = state.launcher_update.lock().unwrap().as_ref() {
+    let update = state.update.lock().unwrap().clone();
+    let restarts = state.launcher_update.lock().unwrap().is_some();
+    if update.available || restarts {
         eval_in_kayak(
             app,
             &format!(
-                "window.__kayakLauncher && window.__kayakLauncher.showUpdate({{kind: \"launcher\", version: {}}})",
-                js_literal(&update.version)
+                "window.__kayakLauncher && window.__kayakLauncher.showUpdate({{date: {}, restarts: {}}})",
+                js_literal(&update.date),
+                restarts,
             ),
         );
-        return;
-    }
-
-    let update = state.update.lock().unwrap().clone();
-    if update.available {
-        show_banner(app, &update);
     }
 }
 
@@ -671,7 +682,28 @@ fn check_launcher_update(app: AppHandle, state: Arc<Launcher>) {
     push_banner_state(&app, &state);
 }
 
+/// Applies everything that is pending: the Kayak images first, then the
+/// launcher itself.
+///
+/// This order is the only one that works unattended. Installing the launcher
+/// restarts the app, so doing it first would abandon a Kayak update halfway
+/// and greet the user with a second banner after the restart — the exact
+/// two-step experience the single banner exists to avoid.
+fn apply_updates(app: AppHandle, state: Arc<Launcher>) {
+    let Some(_guard) = BusyGuard::acquire(&state) else {
+        return;
+    };
+
+    if state.update.lock().unwrap().available && !update_kayak_image(&app, &state) {
+        // The error screen offers its own retry; restarting the launcher on
+        // top of it would wipe the explanation away.
+        return;
+    }
+    apply_launcher_update(app, state);
+}
+
 /// Downloads and installs the launcher update, then restarts into it.
+/// Does nothing when no launcher update is pending.
 fn apply_launcher_update(app: AppHandle, state: Arc<Launcher>) {
     let Some(update) = state.launcher_update.lock().unwrap().take() else {
         return;
@@ -683,9 +715,14 @@ fn apply_launcher_update(app: AppHandle, state: Arc<Launcher>) {
 
     match outcome {
         Ok(()) => {
-            // The container is stopped first: the restart replaces this process,
-            // and an orphaned container would then refuse the name on the way
-            // back up.
+            // Everything this process started is stopped first: the restart
+            // replaces the process, an orphaned container would refuse the
+            // name on the way back up, and an orphaned Metal server would
+            // hold the port the restarted launcher tries to serve on.
+            if let Some(server) = state.metal.lock().unwrap().take() {
+                server.stop();
+            }
+            write_stopped_status(&state);
             shutdown();
             app.restart();
         }
@@ -764,17 +801,17 @@ fn handle_banner_action(
         // The page has a document and can be drawn on. Anything found before
         // this point was pushed into a webview that could not receive it.
         "ready" => push_banner_state(app, &state),
-        "update" => {
+        // "self-update" survives as an alias so a banner injected by an older
+        // launcher build still lands somewhere sensible.
+        "update" | "self-update" => {
             let app = app.clone();
-            thread::spawn(move || apply_update(app, state));
-        }
-        "self-update" => {
-            let app = app.clone();
-            thread::spawn(move || apply_launcher_update(app, state));
+            thread::spawn(move || apply_updates(app, state));
         }
         "dismiss" => {
-            let mut update = state.update.lock().unwrap();
-            update.available = false;
+            state.update.lock().unwrap().available = false;
+            // The one banner covers both updates, so Later must silence both.
+            // The next scheduled check finds the launcher update again.
+            state.launcher_update.lock().unwrap().take();
         }
         "open" => {
             if let Some(target) = query.get("url") {
@@ -866,11 +903,10 @@ fn spawn_update_watcher(app: AppHandle, state: Arc<Launcher>) {
 }
 
 /// Pulls the new images and replaces the running container with them.
-fn apply_update(app: AppHandle, state: Arc<Launcher>) {
-    let Some(_guard) = BusyGuard::acquire(&state) else {
-        return;
-    };
-
+///
+/// Reports success so the combined flow knows whether to carry on to the
+/// launcher update. The caller holds the busy guard.
+fn update_kayak_image(app: &AppHandle, state: &Arc<Launcher>) -> bool {
     logs::record("update", "applying a Kayak update");
     show_banner_progress(&app, "Downloading the new version", -1);
 
@@ -935,24 +971,29 @@ fn apply_update(app: AppHandle, state: Arc<Launcher>) {
             set_stage(&app, &state, Stage::Ready { url: url.clone() });
 
             // The port can change across a restart, so the window is pointed at
-            // the new address rather than simply reloaded.
+            // the new address rather than simply reloaded. Cache-busted: a plain
+            // navigation is served from the webview's HTTP cache, which is
+            // exactly how an update used to bring back the previous release's
+            // UI instead of the one just installed.
             if let Some(window) = app.get_webview_window(KAYAK_WINDOW) {
-                if let Ok(parsed) = url.parse() {
+                if let Ok(parsed) = cache_busted(&url).parse() {
                     let _ = window.navigate(parsed);
                 } else {
-                    let _ = window.eval("location.reload()");
+                    let _ = window.eval("location.reload(true)");
                 }
             }
+            true
         }
         Err(error) => {
             logs::record("update", &format!("update failed: {error}"));
             eval_in_kayak(
-                &app,
+                app,
                 &format!(
                     "window.__kayakLauncher && window.__kayakLauncher.showError({})",
                     js_literal(&error)
                 ),
             );
+            false
         }
     }
 }
@@ -1290,23 +1331,17 @@ fn open_kayak(app: AppHandle, state: tauri::State<'_, Arc<Launcher>>) -> Result<
     show_kayak(&app, &format!("http://127.0.0.1:{port}"))
 }
 
-/// Installs a launcher update already found by the background check.
-#[tauri::command]
-fn install_launcher_update(app: AppHandle, state: tauri::State<'_, Arc<Launcher>>) {
-    let state = state.inner().clone();
-    thread::spawn(move || apply_launcher_update(app, state));
-}
-
 #[tauri::command]
 fn check_updates(app: AppHandle, state: tauri::State<'_, Arc<Launcher>>) {
     let state = state.inner().clone();
     thread::spawn(move || check_for_updates(app, state));
 }
 
+/// Applies whatever is pending — Kayak images, launcher, or both.
 #[tauri::command]
 fn install_update(app: AppHandle, state: tauri::State<'_, Arc<Launcher>>) {
     let state = state.inner().clone();
-    thread::spawn(move || apply_update(app, state));
+    thread::spawn(move || apply_updates(app, state));
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -1323,7 +1358,6 @@ pub fn run() {
             open_kayak,
             check_updates,
             install_update,
-            install_launcher_update,
         ])
         .setup(|app| {
             let handle = app.handle().clone();
@@ -1375,7 +1409,25 @@ pub fn run() {
 
 #[cfg(test)]
 mod tests {
+    use super::cache_busted;
     use super::should_reuse;
+
+    #[test]
+    fn cache_busted_urls_point_at_the_server_root() {
+        let busted = cache_busted("http://127.0.0.1:8001");
+        assert!(
+            busted.starts_with("http://127.0.0.1:8001/?fresh="),
+            "unexpected shape: {busted}"
+        );
+        assert!(busted.parse::<tauri::Url>().is_ok());
+    }
+
+    #[test]
+    fn no_two_navigations_share_a_cache_entry() {
+        // The whole point: a URL that already sits in the webview cache would
+        // be served from it, resurrecting a previous release's UI.
+        assert_ne!(cache_busted("http://127.0.0.1:8001"), cache_busted("http://127.0.0.1:8001"));
+    }
 
     #[test]
     fn reuses_a_container_from_the_current_image() {

@@ -98,13 +98,14 @@
   /**
    * Top bar offering an update. Kayak stays fully usable behind it.
    *
-   * `kind` selects what is being updated: "kayak" replaces the server image,
-   * "launcher" replaces this app and restarts it.
+   * One banner and one button no matter what is out of date. Two things can
+   * need updating — the Kayak server image and the launcher app itself — but
+   * that distinction is plumbing; the button applies everything that is
+   * pending. `restarts` is true when the launcher itself is part of it.
    */
   api.showUpdate = function (info) {
     clear();
     var host = root(true);
-    var launcher = info && info.kind === "launcher";
 
     var bar = document.createElement("div");
     bar.style.cssText = [
@@ -125,20 +126,15 @@
 
     var text = document.createElement("span");
     text.style.cssText = "flex:1;min-width:0";
-    if (launcher) {
-      text.textContent =
-        "A new version of the Kayak app is available" +
-        (info.version ? " (" + info.version + ")" : "") +
-        ". Installing it restarts the app.";
-    } else {
-      text.textContent = info && info.date
+    text.textContent =
+      (info && info.date
         ? "A new version of Kayak is available (published " + info.date + ")."
-        : "A new version of Kayak is available.";
-    }
+        : "A new version of Kayak is available.") +
+      (info && info.restarts ? " The app will restart to finish." : "");
 
     var update = button("Update now", true);
     update.addEventListener("click", function () {
-      send(launcher ? "self-update" : "update");
+      send("update");
     });
 
     var later = button("Later", false);
