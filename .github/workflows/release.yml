@@ -90,3 +90,29 @@ jobs:
           # Produces the latest.json manifest the updater plugin polls.
           includeUpdaterJson: true
           args: ${{ matrix.args }}
+
+  # Old releases serve no one: the updater reads latest.json from the newest
+  # release only, so binaries older than the last three exist purely as
+  # rollback insurance. Pruning here keeps exactly three. Git tags are kept --
+  # they cost nothing and preserve the history a deleted release came from.
+  prune:
+    name: Prune old releases
+    runs-on: ubuntu-latest
+    needs: release
+    steps:
+      - name: Delete releases older than the newest three
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          all=$(gh api "repos/$GH_REPO/releases" --paginate \
+            --jq '.[] | select((.draft or .prerelease) | not) | .tag_name')
+          keep=$(printf '%s\n' $all | sort -V | tail -n 3)
+          echo "keeping:" $keep
+          for tag in $all; do
+            if ! grep -qxF "$tag" <<< "$keep"; then
+              gh release delete "$tag" --repo "$GH_REPO" --yes
+              echo "deleted release $tag"
+            fi
+          done
