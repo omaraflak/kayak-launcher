@@ -21,8 +21,10 @@ use std::time::{Duration, Instant};
 use serde::Serialize;
 use tauri::menu::{AboutMetadata, Menu, MenuBuilder, SubmenuBuilder};
 use tauri::{
-    AppHandle, Emitter, Manager, RunEvent, WebviewUrl, WebviewWindowBuilder, WindowEvent,
+    webview::DownloadEvent, AppHandle, Emitter, Manager, RunEvent, WebviewUrl,
+    WebviewWindowBuilder, WindowEvent,
 };
+use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
 use tauri_plugin_updater::UpdaterExt;
 
 const LAUNCHER_WINDOW: &str = "launcher";
@@ -474,6 +476,73 @@ fn cache_busted(url: &str) -> String {
     format!("{url}/?fresh={millis}-{sequence}")
 }
 
+/// Asks where to save a file Kayak offered for download, then saves it there.
+///
+/// With no handler registered, the webview cancels a `download` link outright, so
+/// pressing Download in Kayak did nothing at all. The webview's own download is
+/// declined and the file fetched here instead: WebKit wants the destination decided
+/// synchronously, inside a callback on the main thread, which is exactly where a
+/// Save panel cannot be shown without stalling the page behind it.
+fn handle_download(app: &AppHandle, event: DownloadEvent<'_>) -> bool {
+    let DownloadEvent::Requested { url, destination } = event else {
+        return true;
+    };
+
+    // A blob: or data: URL exists only inside the page, so only the webview can
+    // save it; it lands in Downloads under the name the page offered.
+    if !matches!(url.scheme(), "http" | "https") {
+        logs::record("download", &format!("saving a {} url to Downloads", url.scheme()));
+        return true;
+    }
+
+    let suggested = destination
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "download".to_string());
+    let mut dialog = app.dialog().file().set_file_name(suggested);
+    if let Some(folder) = destination.parent() {
+        dialog = dialog.set_directory(folder);
+    }
+    // Attached to the Kayak window as a sheet, the way a Mac app asks.
+    if let Some(window) = app.get_webview_window(KAYAK_WINDOW) {
+        dialog = dialog.set_parent(&window);
+    }
+
+    let app = app.clone();
+    let url = url.to_string();
+    dialog.save_file(move |chosen| {
+        let Some(path) = chosen.and_then(|chosen| chosen.into_path().ok()) else {
+            return; // Cancelled.
+        };
+        thread::spawn(move || match save_url(&url, &path) {
+            Ok(()) => logs::record("download", &format!("saved {url} to {}", path.display())),
+            Err(error) => {
+                logs::record("download", &error);
+                app.dialog()
+                    .message(error)
+                    .title("The file could not be saved")
+                    .kind(MessageDialogKind::Error)
+                    .show(|_| {});
+            }
+        });
+    });
+    false
+}
+
+/// Fetches a URL into a file, leaving nothing behind if it fails part-way.
+fn save_url(url: &str, path: &std::path::Path) -> Result<(), String> {
+    let response = ureq::get(url)
+        .call()
+        .map_err(|error| format!("Could not download the file: {error}"))?;
+    let written = std::fs::File::create(path).and_then(|mut file| {
+        std::io::copy(&mut response.into_reader(), &mut file).map(|_| ())
+    });
+    written.map_err(|error| {
+        let _ = std::fs::remove_file(path);
+        format!("Could not write {}: {error}", path.display())
+    })
+}
+
 /// Opens (or focuses) the window that shows Kayak itself.
 fn show_kayak(app: &AppHandle, url: &str) -> Result<(), String> {
     if let Some(window) = app.get_webview_window(KAYAK_WINDOW) {
@@ -488,6 +557,7 @@ fn show_kayak(app: &AppHandle, url: &str) -> Result<(), String> {
 
     let navigation_handle = app.clone();
     let close_handle = app.clone();
+    let download_handle = app.clone();
 
     WebviewWindowBuilder::new(app, KAYAK_WINDOW, WebviewUrl::External(parsed))
         .title("Kayak")
@@ -495,6 +565,7 @@ fn show_kayak(app: &AppHandle, url: &str) -> Result<(), String> {
         .min_inner_size(900.0, 600.0)
         .center()
         .initialization_script(BANNER_JS)
+        .on_download(move |_webview, event| handle_download(&download_handle, event))
         .on_navigation(move |url| {
             let Some(action) = url.path().strip_prefix(ACTION_PREFIX) else {
                 // A scheme this window cannot render, such as mailto:. Kayak
@@ -1337,6 +1408,7 @@ fn install_update(app: AppHandle, state: tauri::State<'_, Arc<Launcher>>) {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
+        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
@@ -1400,7 +1472,11 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::cache_busted;
+    use super::save_url;
     use super::should_reuse;
+    use std::io::{Read, Write};
+    use std::net::TcpListener;
+    use std::path::PathBuf;
 
     #[test]
     fn cache_busted_urls_point_at_the_server_root() {
@@ -1436,5 +1512,57 @@ mod tests {
         assert!(!should_reuse(None, Some("sha256:aaa")));
         assert!(!should_reuse(Some("sha256:aaa"), None));
         assert!(!should_reuse(None, None));
+    }
+
+    /// Answers one request with `response`, returning the URL to fetch it from.
+    fn serve_once(response: &'static [u8]) -> String {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = [0u8; 1024];
+            let _ = stream.read(&mut request);
+            let _ = stream.write_all(response);
+        });
+        format!("http://127.0.0.1:{port}/api/audio/items/1/file")
+    }
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join("kayak-launcher-download");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(name);
+        let _ = std::fs::remove_file(&path);
+        path
+    }
+
+    #[test]
+    fn saves_the_file_where_the_user_chose() {
+        let url = serve_once(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nRIFF!");
+        let path = scratch("saved.wav");
+
+        save_url(&url, &path).unwrap();
+
+        assert_eq!(std::fs::read(&path).unwrap(), b"RIFF!");
+    }
+
+    #[test]
+    fn a_refused_download_creates_nothing() {
+        let url = serve_once(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+        let path = scratch("missing.wav");
+
+        let error = save_url(&url, &path).unwrap_err();
+
+        assert!(error.contains("404"), "{error}");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn a_download_cut_short_leaves_no_partial_file() {
+        // The server promises more than it sends, then hangs up.
+        let url = serve_once(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nRIFF");
+        let path = scratch("partial.wav");
+
+        assert!(save_url(&url, &path).is_err());
+        assert!(!path.exists());
     }
 }
