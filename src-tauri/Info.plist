@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!--
+	  Dictating a message to an agent calls getUserMedia in the Kayak page. The
+	  webview grants that itself, but macOS asks the containing application for
+	  microphone access first, and it only asks when the bundle says why it wants
+	  it. Without this key no permission dialog is ever shown and recording fails
+	  with no explanation, which is what "the microphone dialog doesn't show in
+	  the app" was.
+	-->
+	<key>NSMicrophoneUsageDescription</key>
+	<string>Kayak uses the microphone to turn what you say into a message for your agent.</string>
+</dict>
+</plist>
