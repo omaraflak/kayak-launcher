@@ -6,7 +6,7 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 type Stage =
   | { kind: "checking" }
   | { kind: "docker-missing"; url: string }
-  | { kind: "docker-asleep"; startable: boolean }
+  | { kind: "docker-asleep" }
   | {
       kind: "downloading";
       label: string;
@@ -128,21 +128,13 @@ function render(stage: Stage): void {
     case "docker-asleep": {
       body.appendChild(element("div", "headline", "Docker is not running"));
       body.appendChild(
-        element(
-          "div",
-          "detail",
-          stage.startable
-            ? "Kayak needs Docker running before it can start."
-            : "Start the Docker service, then choose Try again.",
-        ),
+        element("div", "detail", "Kayak needs Docker Desktop running before it can start."),
       );
       body.appendChild(
-        stage.startable
-          ? actions(
-              button("Start Docker", () => void invoke("start_docker"), true),
-              button("Try again", () => void invoke("start")),
-            )
-          : actions(button("Try again", () => void invoke("start"), true)),
+        actions(
+          button("Start Docker", () => void invoke("start_docker"), true),
+          button("Try again", () => void invoke("start")),
+        ),
       );
       break;
     }

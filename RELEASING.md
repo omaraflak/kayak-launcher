@@ -1,7 +1,7 @@
 # Releasing the launcher
 
-Pushing a version tag builds the launcher for macOS (Apple Silicon and Intel), Windows,
-and Linux, and publishes a GitHub release with the installers attached.
+Pushing a version tag builds the launcher for macOS, Apple Silicon and Intel, and
+publishes a GitHub release with the installers attached. Kayak supports macOS only.
 
 This is separate from releasing Kayak itself. Kayak updates through Docker Hub and
 should change often; the launcher updates through GitHub Releases and should barely
@@ -73,15 +73,10 @@ becomes the ordinary unverified-developer warning on both architectures.
 
 What ad-hoc signing does **not** do is satisfy Gatekeeper — `spctl` still rejects the
 bundle, and every user still has to go through System Settings once. Removing that step
-entirely needs:
-
-- **macOS** — an Apple Developer account (99 USD/year) for a Developer ID certificate,
-  plus notarization. Tauri reads `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`,
-  `APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD` and `APPLE_TEAM_ID` from the
-  environment, so this is secrets on the existing workflow rather than new logic.
-- **Windows** — a code-signing certificate from a CA. An OV certificate reduces the
-  SmartScreen warning over time as reputation accrues; an EV certificate removes it
-  immediately.
+entirely needs an Apple Developer account (99 USD/year) for a Developer ID certificate,
+plus notarization. Tauri reads `APPLE_CERTIFICATE`, `APPLE_CERTIFICATE_PASSWORD`,
+`APPLE_SIGNING_IDENTITY`, `APPLE_ID`, `APPLE_PASSWORD` and `APPLE_TEAM_ID` from the
+environment, so this is secrets on the existing workflow rather than new logic.
 
 This is unrelated to `TAURI_SIGNING_PRIVATE_KEY`, which signs *updates* so installed
 launchers can verify them. That one is already set up. Neither replaces the other.
@@ -109,8 +104,8 @@ git tag v1.0.1
 git push --follow-tags
 ```
 
-Watch it at https://github.com/omaraflak/kayak-launcher/actions. Four builds run in
-parallel; expect ten to twenty minutes.
+Watch it at https://github.com/omaraflak/kayak-launcher/actions. Two builds run in
+parallel, one per Mac architecture; expect ten to twenty minutes.
 
 ## After the build
 

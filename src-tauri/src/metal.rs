@@ -63,10 +63,6 @@ fn sysctl(key: &str) -> Option<String> {
 /// presence is itself proof the host is Apple Silicon, and the CPU brand string
 /// is a further fallback for either case.
 pub fn detect_silicon() -> Silicon {
-    if !cfg!(target_os = "macos") {
-        return Silicon::None;
-    }
-
     let translated = sysctl("sysctl.proc_translated").as_deref() == Some("1");
     let native_arm = sysctl("hw.optional.arm64").as_deref() == Some("1");
     let apple_cpu = sysctl("machdep.cpu.brand_string")

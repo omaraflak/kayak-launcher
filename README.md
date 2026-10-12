@@ -1,38 +1,31 @@
 # Kayak Launcher
 
-Desktop app that runs [Kayak](https://github.com/omaraflak/kayak) without a terminal. It
-finds Docker, downloads the images, starts the container, shows Kayak in a window, and
-offers one-click updates when a new version is published.
+Mac app that runs [Kayak](https://github.com/omaraflak/kayak) without a terminal. It
+finds Docker Desktop, downloads the images, starts the container, shows Kayak in a
+window, and offers one-click updates when a new version is published. On Apple Silicon it
+also serves MLX models on the GPU, which a container cannot reach.
+
+Kayak supports macOS only, on Apple Silicon and Intel.
 
 ## Install
 
 1. Install [Docker Desktop](https://www.docker.com/products/docker-desktop/) if you do
    not have it.
-2. Download the launcher for your platform from
+2. Download the launcher for your Mac (Apple Silicon or Intel) from
    [Releases](https://github.com/omaraflak/kayak-launcher/releases).
 3. Open it.
 
-Bundles carry no paid developer certificate, so the operating system blocks the first
-launch. This is a one-time step per machine.
-
-On **macOS**, you get "Apple could not verify Kayak is free of malware". Open it once and
-let it be refused, then go to **System Settings → Privacy & Security**, scroll to the
-Security section, and click **Open Anyway** next to the message about Kayak. Confirm with
-Touch ID or your password.
+The app carries no paid developer certificate, so macOS blocks the first launch with
+"Apple could not verify Kayak is free of malware". This is a one-time step per machine:
+open it once and let it be refused, then go to **System Settings → Privacy & Security**,
+scroll to the Security section, and click **Open Anyway** next to the message about
+Kayak. Confirm with Touch ID or your password.
 
 > Right-clicking the app and choosing **Open** used to work instead. Apple removed that
 > route in macOS 15, so System Settings is now the only one.
 
-On **Windows**, SmartScreen shows "Windows protected your PC". Click **More info**, then
-**Run anyway**.
-
-Your data lives outside the container and survives updates:
-
-| Platform | Path |
-| --- | --- |
-| macOS | `~/Library/Application Support/Kayak/data` |
-| Linux | `~/.local/share/Kayak/data` |
-| Windows | `%APPDATA%\Kayak\data` |
+Your data lives outside the container, in `~/Library/Application Support/Kayak/data`,
+and survives updates.
 
 ## Development
 

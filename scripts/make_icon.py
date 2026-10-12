@@ -21,8 +21,8 @@ SUPERSAMPLE = 3
 BACKGROUND = (26, 115, 232)
 FOREGROUND = (255, 255, 255)
 
-# Rounded-square plate. macOS and Windows both render the icon unmasked, so the
-# icon has to supply its own corner radius and breathing room.
+# Rounded-square plate. macOS renders the icon unmasked, so the icon has to
+# supply its own corner radius and breathing room.
 PLATE_INSET = 0.055
 PLATE_RADIUS = 0.235
 

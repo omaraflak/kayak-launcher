@@ -1,10 +1,9 @@
 //! Thin wrapper over the Docker CLI.
 //!
-//! The launcher shells out to `docker` rather than speaking to the daemon
-//! socket directly. The CLI is the only interface guaranteed to behave the same
-//! across Docker Desktop on macOS and Windows and a plain daemon on Linux, and
-//! it keeps the launcher free of a TLS/named-pipe transport it would otherwise
-//! have to reimplement per platform.
+//! The launcher shells out to `docker` rather than speaking to Docker Desktop's
+//! socket directly: the CLI is what Docker Desktop installs and keeps working
+//! across its own updates, and it handles contexts, proxies and credentials the
+//! launcher would otherwise have to reimplement.
 
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
@@ -31,18 +30,15 @@ pub struct PullProgress {
 
 /// Locates the `docker` executable.
 ///
-/// `PATH` alone is not enough. An app opened from Finder or the Start menu
-/// inherits a minimal environment rather than the one a login shell builds, so
-/// on macOS `PATH` is typically just `/usr/bin:/bin:/usr/sbin:/sbin` and Docker
-/// Desktop's binary is in none of those. Falling back to the known install
-/// locations is what stops the launcher from reporting "Docker is not
-/// installed" on a machine that plainly has it.
+/// `PATH` alone is not enough. An app opened from Finder inherits a minimal
+/// environment rather than the one a login shell builds, so `PATH` is typically
+/// just `/usr/bin:/bin:/usr/sbin:/sbin` and Docker Desktop's binary is in none of
+/// those. Falling back to the known install locations is what stops the
+/// launcher from reporting "Docker is not installed" on a Mac that plainly has it.
 pub fn locate() -> Option<PathBuf> {
-    let binary = if cfg!(windows) { "docker.exe" } else { "docker" };
-
     if let Some(path) = std::env::var_os("PATH") {
         for dir in std::env::split_paths(&path) {
-            let candidate = dir.join(binary);
+            let candidate = dir.join("docker");
             if candidate.is_file() {
                 return Some(candidate);
             }
@@ -56,42 +52,13 @@ pub fn locate() -> Option<PathBuf> {
 
 fn known_locations() -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-
-    // Docker Desktop 4.x installs a per-user CLI here on macOS and Windows.
+    // Docker Desktop 4.x installs a per-user CLI here.
     if let Some(home) = dirs::home_dir() {
         out.push(home.join(".docker").join("bin").join("docker"));
     }
-
-    #[cfg(target_os = "macos")]
-    {
-        out.push("/usr/local/bin/docker".into());
-        out.push("/opt/homebrew/bin/docker".into());
-        out.push("/Applications/Docker.app/Contents/Resources/bin/docker".into());
-    }
-
-    #[cfg(target_os = "linux")]
-    {
-        out.push("/usr/bin/docker".into());
-        out.push("/usr/local/bin/docker".into());
-        out.push("/snap/bin/docker".into());
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        for var in ["ProgramFiles", "ProgramW6432", "LOCALAPPDATA"] {
-            if let Some(root) = std::env::var_os(var) {
-                out.push(
-                    PathBuf::from(root)
-                        .join("Docker")
-                        .join("Docker")
-                        .join("resources")
-                        .join("bin")
-                        .join("docker.exe"),
-                );
-            }
-        }
-    }
-
+    out.push("/usr/local/bin/docker".into());
+    out.push("/opt/homebrew/bin/docker".into());
+    out.push("/Applications/Docker.app/Contents/Resources/bin/docker".into());
     out
 }
 
@@ -108,7 +75,6 @@ fn docker() -> Result<Command, String> {
     if let Ok(path) = std::env::join_paths(helper_search_path(&binary)) {
         command.env("PATH", path);
     }
-    suppress_console(&mut command);
     Ok(command)
 }
 
@@ -116,9 +82,8 @@ fn docker() -> Result<Command, String> {
 ///
 /// The CLI shells out to a credential helper named after `credsStore` in
 /// `~/.docker/config.json` -- `docker-credential-desktop`, `-osxkeychain`, and
-/// so on -- and resolves it through PATH. An app launched from Finder or the
-/// Start menu inherits a minimal PATH containing none of Docker's directories,
-/// so a pull fails with:
+/// so on -- and resolves it through PATH. An app launched from Finder inherits
+/// a minimal PATH containing none of Docker's directories, so a pull fails with:
 ///
 /// ```text
 /// error getting credentials - err: exec: "docker-credential-desktop":
@@ -160,20 +125,6 @@ fn merge_search_dirs(preferred: Vec<PathBuf>, inherited: Vec<PathBuf>) -> Vec<Pa
         .collect()
 }
 
-/// Stops Windows from flashing a console window for each CLI call.
-fn suppress_console(command: &mut Command) {
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-        command.creation_flags(CREATE_NO_WINDOW);
-    }
-    #[cfg(not(windows))]
-    {
-        let _ = command;
-    }
-}
-
 /// Runs a docker subcommand and returns its trimmed stdout.
 fn run(args: &[&str]) -> Result<String, String> {
     let output = docker()?
@@ -207,45 +158,13 @@ pub fn is_daemon_running() -> bool {
         .unwrap_or(false)
 }
 
-/// Asks the OS to start Docker Desktop.
-///
-/// On Linux the daemon is managed by the init system and starting it needs
-/// privileges the launcher does not have, so this is unsupported there.
+/// Asks macOS to start Docker Desktop.
 pub fn start_desktop() -> Result<(), String> {
-    #[cfg(target_os = "macos")]
-    {
-        let mut command = Command::new("/usr/bin/open");
-        command.args(["-a", "Docker"]);
-        command
-            .status()
-            .map_err(|err| format!("Could not start Docker Desktop: {err}"))?;
-        return Ok(());
-    }
-
-    #[cfg(target_os = "windows")]
-    {
-        for var in ["ProgramFiles", "ProgramW6432"] {
-            let Some(root) = std::env::var_os(var) else {
-                continue;
-            };
-            let exe = PathBuf::from(root)
-                .join("Docker")
-                .join("Docker")
-                .join("Docker Desktop.exe");
-            if exe.is_file() {
-                let mut command = Command::new(exe);
-                suppress_console(&mut command);
-                command
-                    .spawn()
-                    .map_err(|err| format!("Could not start Docker Desktop: {err}"))?;
-                return Ok(());
-            }
-        }
-        return Err("Could not find Docker Desktop".to_string());
-    }
-
-    #[allow(unreachable_code)]
-    Err("Start the Docker daemon, then try again".to_string())
+    Command::new("/usr/bin/open")
+        .args(["-a", "Docker"])
+        .status()
+        .map_err(|err| format!("Could not start Docker Desktop: {err}"))?;
+    Ok(())
 }
 
 /// Reports whether an image is present locally.
@@ -610,9 +529,8 @@ pub fn run_container(spec: &RunSpec) -> Result<(), String> {
         &sandbox,
         "--env",
         &host_data,
-        // Lets the server reach services on the host, such as a local vLLM.
-        "--add-host",
-        "host.docker.internal:host-gateway",
+        // No --add-host: Docker Desktop resolves host.docker.internal by itself,
+        // which is how the server reaches model servers published on the Mac.
         spec.image,
     ])
     .map(|_| ())

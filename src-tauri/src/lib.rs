@@ -47,12 +47,8 @@ pub enum Stage {
     DockerMissing {
         url: String,
     },
-    /// Docker is installed but its daemon is not answering.
-    DockerAsleep {
-        /// Whether the launcher can start Docker itself. On Linux the daemon is
-        /// owned by the init system and needs privileges the launcher lacks.
-        startable: bool,
-    },
+    /// Docker Desktop is installed but not running.
+    DockerAsleep,
     Downloading {
         label: String,
         step: u32,
@@ -294,13 +290,7 @@ fn boot(app: AppHandle, state: Arc<Launcher>) {
 
     if !docker::is_daemon_running() {
         logs::record("boot", "docker CLI found but the daemon is not answering");
-        set_stage(
-            &app,
-            &state,
-            Stage::DockerAsleep {
-                startable: cfg!(any(target_os = "macos", target_os = "windows")),
-            },
-        );
+        set_stage(&app, &state, Stage::DockerAsleep);
         return;
     }
 
@@ -351,7 +341,7 @@ fn boot(app: AppHandle, state: Arc<Launcher>) {
         logs::mirror_to(&control.dir.join("launcher.log"));
         logs::record(
             "boot",
-            &format!("launcher {} on {}", env!("CARGO_PKG_VERSION"), std::env::consts::OS),
+            &format!("launcher {} on {}", env!("CARGO_PKG_VERSION"), std::env::consts::ARCH),
         );
         spawn_metal_reconciler(state.clone(), data_dir);
     }
@@ -1024,8 +1014,8 @@ fn ensure_images_for_update(app: &AppHandle, force: bool) -> Result<(), String> 
 
 /// Port the Metal server listens on.
 ///
-/// Deliberately the same port the containerised vLLM would publish, so Kayak
-/// reaches either backend through the one `VLLM_API_BASE` it already has.
+/// The same port the containerised vLLM would publish first. Kayak reads the
+/// port from the status file, so this only needs to stay out of Kayak's own way.
 const METAL_PORT: u16 = 8001;
 
 /// Writes the status file, always carrying the current versions with it.

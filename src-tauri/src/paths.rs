@@ -2,9 +2,10 @@
 
 use std::path::{Path, PathBuf};
 
-/// Directory bind-mounted into the container as `/app/data`.
+/// Directory bind-mounted into the container as `/app/data`:
+/// `~/Library/Application Support/Kayak/data`.
 ///
-/// This has to be a real host path rather than a Docker named volume: the
+/// This has to be a real Mac path rather than a Docker named volume: the
 /// server starts sandbox containers as siblings on the host daemon and mounts
 /// workspace directories into them by host path, which a named volume could not
 /// supply.
@@ -17,9 +18,8 @@ pub fn data_dir() -> PathBuf {
 
 /// Creates the data directory if absent.
 ///
-/// Doing this before `docker run` matters on Linux: the daemon creates a
-/// missing bind-mount source itself, but owned by root, which then leaves the
-/// user unable to read their own Kayak data.
+/// Done before anything else touches it: seeding copies the image's defaults
+/// into it, and `docker run` mounts it.
 pub fn ensure_data_dir() -> Result<PathBuf, String> {
     let dir = data_dir();
     std::fs::create_dir_all(&dir)
