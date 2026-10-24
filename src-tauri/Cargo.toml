@@ -27,6 +27,9 @@ dirs = "5"
 # runs on its own thread alongside blocking Docker CLI calls, so an async
 # runtime would add a dependency without removing any waiting.
 ureq = { version = "2.10", features = ["json"] }
+# Process groups: stopping the GPU server has to reach the engine process vLLM
+# starts, and std can only signal the one child it spawned.
+libc = "0.2"
 
 [profile.release]
 codegen-units = 1

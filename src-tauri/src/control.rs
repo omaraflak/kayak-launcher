@@ -22,6 +22,11 @@ use serde::{Deserialize, Serialize};
 const CONTROL_DIR: &str = ".launcher";
 const DESIRED_FILE: &str = "desired.json";
 const STATUS_FILE: &str = "status.json";
+/// Process group of the running GPU server, so a launcher that crashed or was
+/// force-quit can be followed by one that stops what it left behind.
+const SERVER_PID_FILE: &str = "metal.pid";
+/// The same, for the GPU installer.
+const INSTALLER_PID_FILE: &str = "metal-install.pid";
 
 /// What Kayak wants to be true. Written by the container, read by the launcher.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -30,7 +35,7 @@ pub struct Desired {
     pub metal: MetalDesired,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, PartialEq, Eq)]
+#[derive(Clone, Default, Deserialize, PartialEq, Eq)]
 #[serde(default)]
 pub struct MetalDesired {
     /// Whether a Metal server should be running.
@@ -42,6 +47,24 @@ pub struct MetalDesired {
     /// from one written before the request existed — without the echo, a
     /// stale "ready" from the previous server reads as instant success.
     pub request: Option<String>,
+    /// The user's Hugging Face access token, handed to the GPU server so it
+    /// can download gated models. Without it every gated model failed to
+    /// start. A secret: it is never logged, and `Debug` leaves it out.
+    pub hf_token: Option<String>,
+}
+
+/// Written by hand so the token cannot end up in a log line or a panic
+/// message through a stray `{:?}`.
+impl std::fmt::Debug for MetalDesired {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("MetalDesired")
+            .field("running", &self.running)
+            .field("model", &self.model)
+            .field("request", &self.request)
+            .field("hf_token", &self.hf_token.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
 }
 
 /// What is actually true. Written by the launcher, read by the container.
@@ -71,8 +94,14 @@ pub struct MetalStatus {
     /// One of: stopped, installing, starting, ready, error.
     pub state: String,
     pub model: Option<String>,
+    /// Port the GPU server for `model` listens on, chosen when it starts.
+    /// Zero when no server is starting or running.
     pub port: u16,
+    /// What went wrong, as one sentence Kayak can show as it is.
     pub error: Option<String>,
+    /// What the installer or the server printed before it failed, for Kayak's
+    /// logs panel. Never meant to be shown as the explanation itself.
+    pub error_detail: Option<String>,
     /// Why Metal is unavailable, when the hardware could otherwise do it.
     /// Distinct from `error`, which describes a start that was attempted.
     pub detail: Option<String>,
@@ -82,11 +111,13 @@ pub struct MetalStatus {
     pub request: Option<String>,
 }
 
-/// Locations of the two channel files inside a data directory.
+/// Locations of the channel files inside a data directory.
 pub struct ControlPaths {
     pub dir: PathBuf,
     pub desired: PathBuf,
     pub status: PathBuf,
+    pub server_pid: PathBuf,
+    pub installer_pid: PathBuf,
 }
 
 impl ControlPaths {
@@ -95,6 +126,8 @@ impl ControlPaths {
         Self {
             desired: dir.join(DESIRED_FILE),
             status: dir.join(STATUS_FILE),
+            server_pid: dir.join(SERVER_PID_FILE),
+            installer_pid: dir.join(INSTALLER_PID_FILE),
             dir,
         }
     }
@@ -118,17 +151,42 @@ pub fn read_desired(path: &Path) -> Desired {
 /// observe a half-written document and parse it as "no Metal at all", so the
 /// replacement is made by rename within the same directory.
 pub fn write_status(path: &Path, status: &Status) -> Result<(), String> {
+    let body = serde_json::to_string_pretty(status)
+        .map_err(|err| format!("Could not encode status: {err}"))?;
+    replace_file(path, body.as_bytes(), 0o644)
+}
+
+/// Asks for no GPU server, as if Kayak had.
+///
+/// Called once when the launcher starts. The desired state outlives the app,
+/// so without this the last model Kayak asked for started again by itself at
+/// the next launch -- after a crash, a force-quit, or simply quitting with a
+/// model loaded -- before anyone had asked for it. Owner-only, like the copy
+/// Kayak writes, since that one can carry a token.
+pub fn reset_desired(path: &Path) -> Result<(), String> {
+    let body = r#"{"metal": {"running": false, "model": null, "request": null}}"#;
+    replace_file(path, body.as_bytes(), 0o600)
+}
+
+/// Replaces a file in one step, by writing beside it and renaming over it.
+pub(crate) fn replace_file(path: &Path, body: &[u8], mode: u32) -> Result<(), String> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
     let parent = path
         .parent()
-        .ok_or_else(|| "Status path has no directory".to_string())?;
+        .ok_or_else(|| "Control path has no directory".to_string())?;
     std::fs::create_dir_all(parent)
         .map_err(|err| format!("Could not create {}: {err}", parent.display()))?;
 
-    let body = serde_json::to_string_pretty(status)
-        .map_err(|err| format!("Could not encode status: {err}"))?;
-
     let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, body)
+    let _ = std::fs::remove_file(&temporary);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(mode)
+        .open(&temporary)
+        .and_then(|mut file| file.write_all(body))
         .map_err(|err| format!("Could not write {}: {err}", temporary.display()))?;
     std::fs::rename(&temporary, path)
         .map_err(|err| format!("Could not replace {}: {err}", path.display()))?;
@@ -208,6 +266,7 @@ mod tests {
                 model: Some("mlx-community/X".to_string()),
                 port: 8001,
                 error: None,
+                error_detail: None,
                 detail: None,
                 request: None,
             },
@@ -230,6 +289,66 @@ mod tests {
         // The request key must be present even when empty: its presence is
         // how Kayak knows this launcher can echo requests.
         assert!(raw.contains("\"request\""));
+        // Likewise the raw detail, so Kayak can tell this launcher sends it.
+        assert!(raw.contains("\"error_detail\""));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn hugging_face_token_is_read_but_never_printed() {
+        let dir = std::env::temp_dir().join("kayak-control-token");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("desired.json");
+        std::fs::write(
+            &path,
+            r#"{"metal":{"running":true,"model":"mlx-community/X","hf_token":"hf_secret123"}}"#,
+        )
+        .unwrap();
+
+        let desired = read_desired(&path);
+
+        assert_eq!(desired.metal.hf_token.as_deref(), Some("hf_secret123"));
+        let printed = format!("{desired:?}");
+        assert!(!printed.contains("hf_secret123"), "{printed}");
+        assert!(printed.contains("redacted"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_desired_file_without_a_token_still_parses() {
+        let dir = std::env::temp_dir().join("kayak-control-no-token");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("desired.json");
+        std::fs::write(&path, r#"{"metal":{"running":true,"model":"mlx-community/X"}}"#).unwrap();
+
+        let desired = read_desired(&path);
+
+        assert!(desired.metal.running);
+        assert_eq!(desired.metal.hf_token, None);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn resetting_asks_for_nothing_and_keeps_the_file_private() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = std::env::temp_dir().join("kayak-control-reset");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("desired.json");
+        std::fs::write(
+            &path,
+            r#"{"metal":{"running":true,"model":"mlx-community/X","hf_token":"hf_x"}}"#,
+        )
+        .unwrap();
+
+        reset_desired(&path).unwrap();
+
+        let desired = read_desired(&path);
+        assert!(!desired.metal.running);
+        assert_eq!(desired.metal.model, None);
+        assert_eq!(desired.metal.hf_token, None);
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
         std::fs::remove_dir_all(&dir).ok();
     }
 

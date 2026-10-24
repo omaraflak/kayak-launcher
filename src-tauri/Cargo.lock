@@ -2012,6 +2012,7 @@ name = "kayak-launcher"
 version = "1.2.0"
 dependencies = [
  "dirs 5.0.1",
+ "libc",
  "serde",
  "serde_json",
  "tauri",

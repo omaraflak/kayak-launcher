@@ -6,18 +6,20 @@ import { openUrl } from "@tauri-apps/plugin-opener";
 type Stage =
   | { kind: "checking" }
   | { kind: "docker-missing"; url: string }
-  | { kind: "docker-asleep" }
+  | { kind: "waiting-for-docker" }
+  | { kind: "docker-asleep"; closed: boolean }
   | {
       kind: "downloading";
-      label: string;
       step: number;
       steps: number;
       done: number;
       total: number;
     }
-  | { kind: "starting"; detail: string }
-  | { kind: "ready"; url: string }
-  | { kind: "failed"; message: string; detail: string };
+  | { kind: "starting"; headline: string; hint: string }
+  | { kind: "updating"; message: string; percent: number }
+  | { kind: "ready" }
+  | { kind: "failed"; headline: string; body: string }
+  | { kind: "stopping" };
 
 interface UpdateInfo {
   available: boolean;
@@ -83,6 +85,27 @@ function actions(...buttons: HTMLButtonElement[]): HTMLElement {
   return row;
 }
 
+/**
+ * Puts the failure and the launcher's recent log on the clipboard, for the
+ * user to paste wherever they ask for help. The log itself never appears on
+ * screen: it is written for whoever helps them, not for them.
+ */
+function copyDetailsButton(): HTMLButtonElement {
+  const node = button("Copy details", () => {
+    invoke("copy_details")
+      .then(() => {
+        node.textContent = "Copied";
+      })
+      .catch(() => {
+        node.textContent = "Couldn't copy";
+      })
+      .finally(() => {
+        window.setTimeout(() => (node.textContent = "Copy details"), 2000);
+      });
+  });
+  return node;
+}
+
 /** Progress bar, switching to an indeterminate style until a total is known. */
 function progress(done: number, total: number): HTMLElement {
   const track = element("div", "track");
@@ -96,90 +119,125 @@ function progress(done: number, total: number): HTMLElement {
   return track;
 }
 
+function headline(text: string): HTMLElement {
+  return element("div", "headline", text);
+}
+
+function detail(text: string): HTMLElement {
+  return element("div", "detail", text);
+}
+
 function render(stage: Stage): void {
   body.textContent = "";
 
   switch (stage.kind) {
     case "checking": {
       body.appendChild(element("div", "spinner"));
-      body.appendChild(element("div", "headline", "Getting ready"));
-      body.appendChild(element("div", "detail", "Looking for Docker on this computer."));
+      body.appendChild(headline("Getting ready"));
+      body.appendChild(detail("Looking for Docker Desktop on your Mac."));
       break;
     }
 
     case "docker-missing": {
-      body.appendChild(element("div", "headline", "Kayak needs Docker"));
+      body.appendChild(headline("Kayak needs Docker Desktop"));
       body.appendChild(
-        element(
-          "div",
-          "detail",
-          "Kayak runs inside Docker, which is free. Install it, then come back here and choose Try again.",
+        detail(
+          "Docker Desktop is a free app that Kayak runs on. Install it and open it once, then click Try again.",
         ),
       );
       body.appendChild(
         actions(
-          button("Install Docker", () => void openUrl(stage.url), true),
+          button("Get Docker Desktop", () => void openUrl(stage.url), true),
           button("Try again", () => void invoke("start")),
         ),
       );
       break;
     }
 
+    case "waiting-for-docker": {
+      body.appendChild(element("div", "spinner"));
+      body.appendChild(headline("Waiting for Docker Desktop"));
+      body.appendChild(
+        detail(
+          "This can take a minute. If Docker Desktop asks you something, answer it in its window.",
+        ),
+      );
+      break;
+    }
+
+    // The launcher is still waiting in the background in both cases, so there
+    // is no Try again: opening Docker Desktop is all it takes.
     case "docker-asleep": {
-      body.appendChild(element("div", "headline", "Docker is not running"));
+      body.appendChild(element("div", "spinner"));
       body.appendChild(
-        element("div", "detail", "Kayak needs Docker Desktop running before it can start."),
+        headline(stage.closed ? "Docker Desktop was closed" : "Docker Desktop isn't open"),
       );
       body.appendChild(
-        actions(
-          button("Start Docker", () => void invoke("start_docker"), true),
-          button("Try again", () => void invoke("start")),
+        detail(
+          stage.closed
+            ? "Open Docker Desktop again. Kayak will continue by itself."
+            : "Click Open Docker Desktop and Kayak will carry on by itself.",
         ),
+      );
+      body.appendChild(
+        actions(button("Open Docker Desktop", () => void invoke("open_docker"), true)),
       );
       break;
     }
 
+    // Both downloads share one headline: that Kayak comes as two images is
+    // plumbing, and "Agent sandbox" meant nothing to the people reading it.
     case "downloading": {
-      const scope =
-        stage.steps > 1 ? ` (${stage.step} of ${stage.steps})` : "";
-      body.appendChild(element("div", "headline", `Downloading ${stage.label}`));
-      body.appendChild(
-        element(
-          "div",
-          "detail",
-          stage.total > 0
-            ? `${stage.done} of ${stage.total} parts${scope}`
-            : `This happens once and can take a few minutes${scope}.`,
-        ),
-      );
+      const step = stage.steps > 1 ? `Step ${stage.step} of ${stage.steps}. ` : "";
+      body.appendChild(headline("Downloading Kayak"));
+      body.appendChild(detail(`${step}This happens once and can take a few minutes.`));
       body.appendChild(progress(stage.done, stage.total));
       break;
     }
 
     case "starting": {
       body.appendChild(element("div", "spinner"));
-      body.appendChild(element("div", "headline", stage.detail));
-      body.appendChild(element("div", "detail", "This usually takes a few seconds."));
+      body.appendChild(headline(stage.headline));
+      body.appendChild(detail(stage.hint));
+      break;
+    }
+
+    case "updating": {
+      body.appendChild(headline("Updating Kayak"));
+      body.appendChild(detail(stage.message));
+      body.appendChild(
+        stage.percent >= 0 ? progress(stage.percent, 100) : progress(0, 0),
+      );
       break;
     }
 
     case "ready": {
-      body.appendChild(element("div", "headline", "Kayak is running"));
-      body.appendChild(element("div", "detail", stage.url));
+      body.appendChild(headline("Kayak is running"));
+      body.appendChild(detail("Kayak is open in its own window."));
       body.appendChild(
-        actions(button("Open Kayak", () => void invoke("open_kayak"), true)),
+        actions(button("Show Kayak", () => void invoke("open_kayak"), true)),
       );
       break;
     }
 
+    // What happened and what to do, in words. The error text behind it goes
+    // to the log, which Copy details and Help › Show Kayak Log both reach.
     case "failed": {
-      body.appendChild(element("div", "headline", stage.message));
-      if (stage.detail) {
-        body.appendChild(element("pre", "log", stage.detail));
-      }
+      body.appendChild(headline(stage.headline));
+      body.appendChild(detail(stage.body));
       body.appendChild(
-        actions(button("Try again", () => void invoke("start"), true)),
+        actions(
+          button("Try again", () => void invoke("start"), true),
+          copyDetailsButton(),
+        ),
       );
+      break;
+    }
+
+    case "stopping": {
+      body.appendChild(element("div", "spinner"));
+      body.appendChild(headline("Shutting down"));
+      body.appendChild(detail("Stopping Kayak and saving your data."));
       break;
     }
   }

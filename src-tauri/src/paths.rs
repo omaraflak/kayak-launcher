@@ -38,3 +38,92 @@ pub fn is_unseeded(dir: &Path) -> bool {
         Ok(mut entries) => entries.next().is_none(),
     }
 }
+
+/// Where the starter files are copied before being moved into place.
+///
+/// A sibling of the data directory, so the final move is a rename within one
+/// volume rather than a copy.
+pub fn seed_staging_dir(data_dir: &Path) -> PathBuf {
+    data_dir.with_file_name("data.seeding")
+}
+
+/// Moves a complete set of starter files into the (empty) data directory.
+///
+/// Copying straight into the data directory left a half-copied one behind
+/// when the copy was interrupted, and because emptiness is the signal for
+/// seeding, the missing defaults were never copied again. Copying elsewhere
+/// first and renaming means the data directory goes from empty to complete in
+/// one step. A rename replaces an empty directory outright; anything that has
+/// appeared in it meanwhile is kept, and the staged files are moved in beside it.
+pub fn adopt_seed(staging: &Path, data_dir: &Path) -> Result<(), String> {
+    if std::fs::rename(staging, data_dir).is_ok() {
+        return Ok(());
+    }
+    let entries = std::fs::read_dir(staging)
+        .map_err(|err| format!("Could not read {}: {err}", staging.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|err| format!("Could not read {}: {err}", staging.display()))?;
+        let target = data_dir.join(entry.file_name());
+        if target.exists() {
+            continue;
+        }
+        std::fs::rename(entry.path(), &target)
+            .map_err(|err| format!("Could not move {}: {err}", entry.path().display()))?;
+    }
+    let _ = std::fs::remove_dir_all(staging);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join("kayak-launcher-seed").join(name);
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn staged_files_replace_an_empty_data_directory() {
+        let root = scratch("empty");
+        let data = root.join("data");
+        std::fs::create_dir_all(&data).unwrap();
+        let staging = seed_staging_dir(&data);
+        std::fs::create_dir_all(staging.join("agents")).unwrap();
+        std::fs::write(staging.join("agents").join("default.json"), "{}").unwrap();
+
+        assert!(is_unseeded(&data));
+        adopt_seed(&staging, &data).unwrap();
+
+        assert!(data.join("agents").join("default.json").is_file());
+        assert!(!staging.exists());
+        assert!(!is_unseeded(&data));
+    }
+
+    #[test]
+    fn staged_files_join_anything_already_there() {
+        let root = scratch("busy");
+        let data = root.join("data");
+        std::fs::create_dir_all(data.join(".launcher")).unwrap();
+        let staging = seed_staging_dir(&data);
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("settings.json"), "{}").unwrap();
+
+        adopt_seed(&staging, &data).unwrap();
+
+        assert!(data.join(".launcher").is_dir());
+        assert!(data.join("settings.json").is_file());
+        assert!(!staging.exists());
+    }
+
+    #[test]
+    fn the_staging_directory_sits_beside_the_data_directory() {
+        let data = PathBuf::from("/Users/me/Library/Application Support/Kayak/data");
+        assert_eq!(
+            seed_staging_dir(&data),
+            PathBuf::from("/Users/me/Library/Application Support/Kayak/data.seeding")
+        );
+    }
+}

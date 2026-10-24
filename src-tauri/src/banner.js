@@ -221,7 +221,14 @@
     host.appendChild(box);
   };
 
-  api.showError = function (message) {
+  /**
+   * Says an update did not go through, with a way to retry and a way out.
+   *
+   * `notice` carries the title, the message and the label of the button that
+   * closes it, all written by the launcher. There is always a way out: Kayak
+   * is still running behind this, on the version the user already had.
+   */
+  api.showError = function (notice) {
     clear();
     var host = root(true);
     var box = scrim(true);
@@ -230,12 +237,12 @@
 
     var title = document.createElement("div");
     title.style.cssText = "font-size:17px;font-weight:600";
-    title.textContent = "The update could not be installed";
+    title.textContent = (notice && notice.title) || "Couldn't update Kayak";
 
     var detail = document.createElement("div");
     detail.style.cssText =
       "font-size:13px;opacity:.75;max-width:460px;line-height:1.5;word-break:break-word";
-    detail.textContent = message;
+    detail.textContent = (notice && notice.message) || "";
 
     var row = document.createElement("div");
     row.style.cssText = "display:flex;gap:10px";
@@ -247,7 +254,7 @@
       send("update");
     });
 
-    var dismiss = button("Continue without updating", false);
+    var dismiss = button((notice && notice.dismiss) || "Not now", false);
     dismiss.addEventListener("click", function () {
       api.hide();
       send("dismiss");

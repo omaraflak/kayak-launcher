@@ -44,8 +44,20 @@ pub const DOCKER_SOCKET: &str = "/var/run/docker.sock";
 /// treating the start as failed.
 pub const HEALTH_TIMEOUT_SECS: u64 = 180;
 
-/// Where users are sent when Docker is missing.
-pub const DOCKER_INSTALL_URL: &str = "https://www.docker.com/products/docker-desktop/";
+/// First port tried for the GPU server.
+///
+/// Away from Kayak's own range on purpose: when 8000 is taken, Kayak itself
+/// moves to 8001, which is where the GPU server used to be fixed.
+pub const METAL_PORT: u16 = 8100;
+
+/// How many ports to try for the GPU server before letting the system pick.
+pub const METAL_PORT_SCAN_RANGE: u16 = 100;
+
+/// Docker Desktop's direct downloads, one per kind of Mac. These are the links
+/// Docker's own download page uses; linking to the right one spares the user a
+/// choice between "Apple Silicon" and "Intel" they may not know how to make.
+pub const DOCKER_DOWNLOAD_APPLE_CHIP: &str = "https://desktop.docker.com/mac/main/arm64/Docker.dmg";
+pub const DOCKER_DOWNLOAD_INTEL_CHIP: &str = "https://desktop.docker.com/mac/main/amd64/Docker.dmg";
 
 pub fn server_image() -> String {
     format!("{SERVER_REPO}:{TAG}")

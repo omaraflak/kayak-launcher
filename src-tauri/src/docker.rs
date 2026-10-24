@@ -9,7 +9,42 @@ use std::collections::HashMap;
 use std::io::{BufRead, BufReader};
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Mutex;
+use std::time::{Duration, Instant};
+
+use crate::explain::{DOCKER_STOPPED, DOCKER_UNRESPONSIVE, DOCKER_WONT_OPEN, SHUTTING_DOWN};
+use crate::lock;
+use crate::process::{self, RunError};
+
+/// Longest a quick query -- version, inspect, port, tag, rm -- may take.
+///
+/// Every Docker call has a limit because Docker Desktop in a bad state accepts
+/// the connection and then answers nothing, and an unbounded call turned that
+/// into a spinner that never ended and a quit that never finished.
+const QUICK: Duration = Duration::from_secs(15);
+
+/// Limit for `docker stop`, which itself waits up to [`STOP_GRACE_SECS`] for
+/// the server, so this has to sit comfortably beyond that.
+const STOP_LIMIT: Duration = Duration::from_secs(60);
+
+/// Limit for creating and starting a container, which a Docker Desktop that has
+/// only just started can be slow to do.
+const RUN_LIMIT: Duration = Duration::from_secs(120);
+
+/// Limit for copying the starter files out of the image, and for deleting an
+/// image of several gigabytes.
+const COPY_LIMIT: Duration = Duration::from_secs(120);
+
+/// How long a download may print nothing before Docker Desktop is checked on.
+///
+/// Silence alone is not a stall. Piped rather than shown in a terminal, Docker
+/// prints one line when a layer starts downloading and the next when it
+/// finishes, so a large layer on a slow connection is minutes of silence while
+/// everything is fine. What silence does justify is asking whether Docker
+/// Desktop is still answering at all.
+const PULL_QUIET_LIMIT: Duration = Duration::from_secs(180);
 
 /// Status of the container the launcher owns.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -19,6 +54,26 @@ pub enum ContainerState {
     Running,
     /// Exists but is not running (exited, created, paused, ...).
     Stopped,
+}
+
+/// Whether Docker Desktop is there to talk to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Daemon {
+    Running,
+    /// Not running, or not installed: the call failed straight away.
+    Stopped,
+    /// Something accepted the call but never answered it -- typically Docker
+    /// Desktop still starting up, or stuck.
+    Unresponsive,
+}
+
+/// What happened when macOS was asked to open Docker Desktop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesktopLaunch {
+    Opened,
+    /// macOS has no app by that name, so Docker Desktop is not installed even
+    /// if a `docker` command is.
+    NotInstalled,
 }
 
 /// Progress of a `docker pull`, counted in layers.
@@ -125,12 +180,38 @@ fn merge_search_dirs(preferred: Vec<PathBuf>, inherited: Vec<PathBuf>) -> Vec<Pa
         .collect()
 }
 
-/// Runs a docker subcommand and returns its trimmed stdout.
+/// Runs a quick docker subcommand and returns its trimmed stdout.
 fn run(args: &[&str]) -> Result<String, String> {
-    let output = docker()?
-        .args(args)
-        .output()
-        .map_err(|err| format!("Could not run docker: {err}"))?;
+    run_within(args, QUICK)
+}
+
+/// Runs a docker subcommand, giving up on it once `limit` has passed.
+///
+/// A call that runs out of time fails with [`DOCKER_UNRESPONSIVE`] at the start
+/// of its message, which is how both [`daemon`] and the failure screen tell a
+/// Docker Desktop that is stuck from one that said no.
+fn run_within(args: &[&str], limit: Duration) -> Result<String, String> {
+    run_within_env(args, &[], limit)
+}
+
+/// `run_within`, with extra variables in the Docker CLI's own environment.
+fn run_within_env(args: &[&str], environment: &[(&str, &str)], limit: Duration) -> Result<String, String> {
+    let mut command = docker()?;
+    command.args(args);
+    for (name, value) in environment {
+        command.env(name, value);
+    }
+    let output = match process::output_within(&mut command, limit) {
+        Ok(output) => output,
+        Err(RunError::TimedOut) => {
+            return Err(format!(
+                "{DOCKER_UNRESPONSIVE}: `docker {}` gave no answer within {} seconds",
+                args.first().copied().unwrap_or_default(),
+                limit.as_secs()
+            ))
+        }
+        Err(RunError::Spawn(err)) => return Err(format!("Could not run docker: {err}")),
+    };
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -143,28 +224,50 @@ fn run(args: &[&str]) -> Result<String, String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+fn timed_out(error: &str) -> bool {
+    error.starts_with(DOCKER_UNRESPONSIVE)
+}
+
 /// Reports whether the Docker CLI is present on this machine.
 pub fn is_installed() -> bool {
     locate().is_some()
 }
 
-/// Reports whether the Docker daemon is reachable.
+/// Asks Docker Desktop whether it is running.
 ///
 /// Distinct from [`is_installed`]: Docker Desktop is frequently installed but
-/// not started, and the two cases need different guidance in the UI.
-pub fn is_daemon_running() -> bool {
-    run(&["version", "--format", "{{.Server.Version}}"])
-        .map(|version| !version.is_empty())
-        .unwrap_or(false)
+/// not started, and the two cases need different handling. A call that times
+/// out is reported separately again, because a Docker Desktop that is stuck
+/// needs restarting, not opening.
+pub fn daemon() -> Daemon {
+    match run(&["version", "--format", "{{.Server.Version}}"]) {
+        Ok(version) if !version.is_empty() => Daemon::Running,
+        Err(error) if timed_out(&error) => Daemon::Unresponsive,
+        _ => Daemon::Stopped,
+    }
 }
 
-/// Asks macOS to start Docker Desktop.
-pub fn start_desktop() -> Result<(), String> {
-    Command::new("/usr/bin/open")
-        .args(["-a", "Docker"])
-        .status()
-        .map_err(|err| format!("Could not start Docker Desktop: {err}"))?;
-    Ok(())
+/// Asks macOS to open Docker Desktop, or to bring it forward if it is open.
+///
+/// The exit status is the point: `open` fails when there is no app by that
+/// name, which is how a Mac with only a stray `docker` command -- and no Docker
+/// Desktop -- is told apart from one where Docker Desktop is just not running.
+pub fn open_desktop() -> Result<DesktopLaunch, String> {
+    match process::output_within(Command::new("/usr/bin/open").args(["-a", "Docker"]), QUICK) {
+        Ok(output) if output.status.success() => Ok(DesktopLaunch::Opened),
+        Ok(output) => {
+            crate::logs::record(
+                "docker",
+                &format!(
+                    "macOS could not open Docker Desktop: {}",
+                    String::from_utf8_lossy(&output.stderr).trim()
+                ),
+            );
+            Ok(DesktopLaunch::NotInstalled)
+        }
+        Err(RunError::TimedOut) => Err(format!("{DOCKER_WONT_OPEN}: `open` did not return")),
+        Err(RunError::Spawn(err)) => Err(format!("{DOCKER_WONT_OPEN}: {err}")),
+    }
 }
 
 /// Reports whether an image is present locally.
@@ -224,7 +327,13 @@ pub fn image_id(image: &str) -> Option<String> {
 /// image a container still references, which is the correct outcome when
 /// something is still using it.
 pub fn remove_image(id: &str) -> Result<(), String> {
-    run(&["image", "rm", id]).map(|_| ())
+    run_within(&["image", "rm", id], COPY_LIMIT).map(|_| ())
+}
+
+/// Points a tag at an image, which is how a failed update puts the previous
+/// version back in place.
+pub fn tag(image_id: &str, tag: &str) -> Result<(), String> {
+    run(&["tag", image_id, tag]).map(|_| ())
 }
 
 /// Pulls an image, reporting layer-level progress.
@@ -232,18 +341,21 @@ pub fn remove_image(id: &str) -> Result<(), String> {
 /// Progress is counted in layers rather than bytes because Docker only prints
 /// byte counters when stdout is a terminal; piped into the launcher it emits one
 /// plain status line per layer transition instead.
-pub fn pull<F>(image: &str, mut on_progress: F) -> Result<(), String>
+///
+/// The pull is abandoned as soon as `cancel` is set, which is how quitting
+/// stops a download of several gigabytes instead of waiting it out.
+pub fn pull<F>(image: &str, cancel: &AtomicBool, mut on_progress: F) -> Result<(), String>
 where
     F: FnMut(PullProgress),
 {
-    match pull_once(image, None, &mut on_progress) {
+    match pull_once(image, None, cancel, &mut on_progress) {
         Err(error) if is_credential_failure(&error) => {
             // The user's Docker config names a credential helper that cannot be
             // run. Both Kayak images are public, so the pull needs no
             // credentials at all and can be retried against a config that asks
             // for none, rather than failing a first launch over it.
             let config = credential_free_config()?;
-            pull_once(image, Some(&config), &mut on_progress)
+            pull_once(image, Some(&config), cancel, &mut on_progress)
         }
         result => result,
     }
@@ -272,6 +384,7 @@ fn credential_free_config() -> Result<PathBuf, String> {
 fn pull_once(
     image: &str,
     config_dir: Option<&Path>,
+    cancel: &AtomicBool,
     on_progress: &mut dyn FnMut(PullProgress),
 ) -> Result<(), String> {
     let mut command = docker()?;
@@ -282,40 +395,63 @@ fn pull_once(
 
     let mut child = command
         .args(["pull", image])
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .map_err(|err| format!("Could not run docker pull: {err}"))?;
 
-    // stderr is drained on its own thread: leaving it unread risks the pipe
-    // filling and blocking the pull if Docker writes warnings during a long
-    // download.
+    let stdout = child.stdout.take();
     let stderr = child.stderr.take();
-    let stderr_reader = std::thread::spawn(move || {
-        let mut collected = String::new();
-        if let Some(stderr) = stderr {
-            for line in BufReader::new(stderr).lines().map_while(Result::ok) {
-                collected.push_str(&line);
-                collected.push('\n');
+    // Shared with the watchdog, which may have to kill it while this thread is
+    // blocked reading its output.
+    let child = Mutex::new(child);
+    let last_output = Mutex::new(Instant::now());
+    let reading = AtomicBool::new(true);
+    let abandoned: Mutex<Option<String>> = Mutex::new(None);
+
+    let stderr = std::thread::scope(|scope| {
+        // stderr is drained on its own thread: leaving it unread risks the
+        // pipe filling and blocking the pull if Docker writes warnings during
+        // a long download.
+        let stderr_reader = scope.spawn(|| {
+            let mut collected = String::new();
+            if let Some(stderr) = stderr {
+                for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+                    *lock(&last_output) = Instant::now();
+                    collected.push_str(&line);
+                    collected.push('\n');
+                }
+            }
+            collected
+        });
+        scope.spawn(|| watch_pull(&child, &last_output, &reading, cancel, &abandoned));
+
+        if let Some(stdout) = stdout {
+            let mut layers: HashMap<String, String> = HashMap::new();
+            for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+                *lock(&last_output) = Instant::now();
+                if let Some(progress) = absorb_line(&line, &mut layers) {
+                    on_progress(progress);
+                }
             }
         }
-        collected
+        reading.store(false, Ordering::SeqCst);
+        stderr_reader.join().unwrap_or_default()
     });
 
-    if let Some(stdout) = child.stdout.take() {
-        let mut layers: HashMap<String, String> = HashMap::new();
-        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-            if let Some(progress) = absorb_line(&line, &mut layers) {
-                on_progress(progress);
-            }
-        }
-    }
-
     let status = child
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
         .wait()
         .map_err(|err| format!("docker pull did not finish: {err}"))?;
-    let stderr = stderr_reader.join().unwrap_or_default();
 
+    if let Some(reason) = abandoned
+        .into_inner()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        return Err(reason);
+    }
     if status.success() {
         return Ok(());
     }
@@ -325,6 +461,50 @@ fn pull_once(
     } else {
         detail.to_string()
     })
+}
+
+/// Kills a pull that is no longer wanted, or that Docker Desktop has stopped
+/// serving.
+///
+/// Runs beside the thread reading the pull's output, because that thread is
+/// blocked in a read and cannot notice anything until Docker writes again.
+fn watch_pull(
+    child: &Mutex<Child>,
+    last_output: &Mutex<Instant>,
+    reading: &AtomicBool,
+    cancel: &AtomicBool,
+    abandoned: &Mutex<Option<String>>,
+) {
+    while reading.load(Ordering::SeqCst) {
+        std::thread::sleep(Duration::from_millis(250));
+
+        let reason = if cancel.load(Ordering::SeqCst) {
+            Some(SHUTTING_DOWN.to_string())
+        } else if lock(last_output).elapsed() >= PULL_QUIET_LIMIT {
+            match daemon() {
+                // Still answering, so the silence is a large layer still on its
+                // way; check again after another quiet spell.
+                Daemon::Running => {
+                    *lock(last_output) = Instant::now();
+                    None
+                }
+                Daemon::Stopped => Some(format!("{DOCKER_STOPPED} during the download")),
+                Daemon::Unresponsive => Some(format!(
+                    "{DOCKER_UNRESPONSIVE}: the download printed nothing for {} seconds",
+                    PULL_QUIET_LIMIT.as_secs()
+                )),
+            }
+        } else {
+            None
+        };
+
+        if let Some(reason) = reason {
+            crate::logs::record("docker", &format!("abandoning the download: {reason}"));
+            *lock(abandoned) = Some(reason);
+            let _ = lock(child).kill();
+            return;
+        }
+    }
 }
 
 /// Layer status lines Docker emits, in the order a layer moves through them.
@@ -392,24 +572,29 @@ pub fn copy_out_of_image(image: &str, source: &str, destination: &Path) -> Resul
     // A leftover from an interrupted previous attempt would make `create` fail
     // on the name.
     let _ = run(&["rm", "--force", SCRATCH]);
-    run(&["create", "--name", SCRATCH, image])?;
+    run_within(&["create", "--name", SCRATCH, image], RUN_LIMIT)?;
 
     // The trailing `/.` copies the directory's contents into the destination
     // rather than nesting the directory itself inside it.
     let from = format!("{SCRATCH}:{source}/.");
     let to = destination.to_string_lossy().to_string();
-    let result = run(&["cp", &from, &to]);
+    let result = run_within(&["cp", &from, &to], COPY_LIMIT);
 
     let _ = run(&["rm", "--force", SCRATCH]);
     result.map(|_| ())
 }
 
 /// Reports the state of a container by name.
-pub fn container_state(name: &str) -> ContainerState {
-    match run(&["inspect", "--format", "{{.State.Status}}", name]) {
-        Err(_) => ContainerState::Missing,
-        Ok(status) if status == "running" => ContainerState::Running,
-        Ok(_) => ContainerState::Stopped,
+///
+/// Only "no such container" means missing. Any other failure -- Docker Desktop
+/// stopped or not answering -- is an error, because reading it as "missing"
+/// told the launcher a healthy server had exited the moment Docker hiccuped.
+pub fn container_state(name: &str) -> Result<ContainerState, String> {
+    match run(&["inspect", "--type", "container", "--format", "{{.State.Status}}", name]) {
+        Ok(status) if status == "running" => Ok(ContainerState::Running),
+        Ok(_) => Ok(ContainerState::Stopped),
+        Err(error) if error.to_ascii_lowercase().contains("no such") => Ok(ContainerState::Missing),
+        Err(error) => Err(error),
     }
 }
 
@@ -438,7 +623,7 @@ pub fn published_port(name: &str) -> Option<u16> {
 
 /// Stops and deletes a container, ignoring one that is already gone.
 pub fn remove_container(name: &str) -> Result<(), String> {
-    if container_state(name) == ContainerState::Missing {
+    if container_state(name)? == ContainerState::Missing {
         return Ok(());
     }
     // `rm --force` also stops it, so a single call covers running and stopped.
@@ -457,10 +642,10 @@ const STOP_GRACE_SECS: &str = "30";
 
 /// Stops a container without deleting it.
 pub fn stop_container(name: &str) -> Result<(), String> {
-    if container_state(name) != ContainerState::Running {
+    if container_state(name)? != ContainerState::Running {
         return Ok(());
     }
-    run(&["stop", "-t", STOP_GRACE_SECS, name]).map(|_| ())
+    run_within(&["stop", "-t", STOP_GRACE_SECS, name], STOP_LIMIT).map(|_| ())
 }
 
 /// Everything needed to start the Kayak server container.
@@ -469,6 +654,8 @@ pub struct RunSpec<'a> {
     pub name: &'a str,
     pub port: u16,
     pub data_dir: &'a Path,
+    /// The key the server will require of every request; see `access`.
+    pub access_key: Option<&'a str>,
 }
 
 /// Creates and starts the Kayak server container.
@@ -505,7 +692,7 @@ pub fn run_container(spec: &RunSpec) -> Result<(), String> {
     // `/app/data`, so the host equivalent is passed in explicitly.
     let host_data = format!("KAYAK_HOST_DATA_DIR={data}");
 
-    run(&[
+    let mut args = vec![
         "run",
         "--detach",
         "--name",
@@ -531,9 +718,39 @@ pub fn run_container(spec: &RunSpec) -> Result<(), String> {
         &host_data,
         // No --add-host: Docker Desktop resolves host.docker.internal by itself,
         // which is how the server reaches model servers published on the Mac.
-        spec.image,
-    ])
-    .map(|_| ())
+    ];
+    // Named only: Docker copies the value from its own environment, so the key
+    // never appears in a command line that any process on the Mac can list.
+    let mut environment: Vec<(&str, &str)> = Vec::new();
+    if let Some(key) = spec.access_key {
+        args.extend(["--env", crate::access::ENV_NAME]);
+        environment.push((crate::access::ENV_NAME, key));
+    }
+    args.push(spec.image);
+    run_within_env(&args, &environment, RUN_LIMIT).map(|_| ())
+}
+
+/// Whether a container was created with `name=value` in its environment.
+///
+/// How a running server is checked for the access key it should require. False
+/// when the container cannot be inspected, which leads to it being replaced --
+/// the safe direction.
+pub fn container_has_env(container: &str, name: &str, value: &str) -> bool {
+    let Ok(output) = run(&[
+        "container",
+        "inspect",
+        container,
+        "--format",
+        "{{range .Config.Env}}{{println .}}{{end}}",
+    ]) else {
+        return false;
+    };
+    env_lines_contain(&output, name, value)
+}
+
+fn env_lines_contain(output: &str, name: &str, value: &str) -> bool {
+    let wanted = format!("{name}={value}");
+    output.lines().any(|line| line.trim_end() == wanted)
 }
 
 /// Returns the last lines of a container's logs, for diagnosing a failed start.
@@ -542,7 +759,8 @@ pub fn container_logs(name: &str, lines: u32) -> String {
     let Ok(mut command) = docker() else {
         return String::new();
     };
-    let Ok(output) = command.args(["logs", "--tail", &count, name]).output() else {
+    command.args(["logs", "--tail", &count, name]);
+    let Ok(output) = process::output_within(&mut command, QUICK) else {
         return String::new();
     };
     // Container logs arrive on both streams; failures are usually on stderr.
@@ -555,21 +773,46 @@ pub fn container_logs(name: &str, lines: u32) -> String {
 ///
 /// Falling back matters because 8000 is a popular development port; without
 /// this, Kayak would fail to start for anyone already running something there.
+/// When every port in the range is taken the system is asked for any free port
+/// rather than giving up: an unusual port is a far better outcome than Kayak
+/// not starting at all.
 pub fn find_free_port(preferred: u16, range: u16) -> Result<u16, String> {
-    for port in preferred..preferred.saturating_add(range) {
+    for port in preferred.max(1)..preferred.saturating_add(range) {
         if TcpListener::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
             return Ok(port);
         }
     }
-    Err(format!(
-        "No free port between {preferred} and {}",
-        preferred.saturating_add(range)
-    ))
+    TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+        .and_then(|listener| listener.local_addr())
+        .map(|address| address.port())
+        .map_err(|err| format!("Could not find a free port: {err}"))
+}
+
+/// Reports whether `docker run` failed because the host port was taken.
+///
+/// [`find_free_port`] checks a port by binding it and letting go, so another
+/// program can take it in the moment before Docker does. Docker Desktop also
+/// keeps ports of its own that a bind from this process does not see.
+pub fn is_port_clash(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    error.contains("port is already allocated")
+        || error.contains("address already in use")
+        || error.contains("ports are not available")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finds_a_variable_in_a_container_environment() {
+        let output = "PATH=/usr/bin\nKAYAK_AUTH_TOKEN=abc123\nKAYAK_PORT=8000\n";
+
+        assert!(env_lines_contain(output, "KAYAK_AUTH_TOKEN", "abc123"));
+        assert!(!env_lines_contain(output, "KAYAK_AUTH_TOKEN", "abc"));
+        assert!(!env_lines_contain(output, "KAYAK_AUTH_TOKEN", "other"));
+        assert!(!env_lines_contain("", "KAYAK_AUTH_TOKEN", "abc123"));
+    }
 
     fn progress(lines: &[&str]) -> Option<PullProgress> {
         let mut layers = HashMap::new();
@@ -689,6 +932,49 @@ mod tests {
             "manifest for omaraflak/kayak:latest not found"
         ));
         assert!(!is_credential_failure("no space left on device"));
+    }
+
+    #[test]
+    fn a_free_preferred_port_is_used() {
+        let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+        // The listener is dropped above, so the port is free again.
+        assert_eq!(find_free_port(port, 1).unwrap(), port);
+    }
+
+    #[test]
+    fn a_full_range_falls_back_to_a_port_the_system_picks() {
+        // Used to fail outright with "No free port between ...", which stopped
+        // Kayak from starting on a machine with busy development ports.
+        let taken = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = taken.local_addr().unwrap().port();
+
+        let chosen = find_free_port(port, 1).unwrap();
+
+        assert_ne!(chosen, port);
+        assert_ne!(chosen, 0);
+    }
+
+    #[test]
+    fn recognises_a_port_clash_from_docker() {
+        assert!(is_port_clash(
+            "docker: Error response from daemon: Ports are not available: exposing port TCP \
+             127.0.0.1:8000 -> 0.0.0.0:0: listen tcp 127.0.0.1:8000: bind: address already in use."
+        ));
+        assert!(is_port_clash(
+            "Bind for 127.0.0.1:8000 failed: port is already allocated"
+        ));
+        assert!(!is_port_clash("no space left on device"));
+        assert!(!is_port_clash("Conflict. The container name \"/kayak-app\" is already in use"));
+    }
+
+    #[test]
+    fn only_a_timed_out_call_reads_as_unresponsive() {
+        assert!(timed_out(&format!("{DOCKER_UNRESPONSIVE}: `docker version` gave no answer")));
+        assert!(!timed_out("Cannot connect to the Docker daemon"));
     }
 
     #[test]
