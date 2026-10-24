@@ -1,6 +1,6 @@
 [package]
 name = "kayak-launcher"
-version = "1.3.0"
+version = "1.4.0"
 description = "Runs and updates Kayak"
 authors = ["Omar Aflak"]
 edition = "2021"
