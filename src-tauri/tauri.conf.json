@@ -29,7 +29,7 @@
     "targets": ["app", "dmg"],
     "createUpdaterArtifacts": true,
     "shortDescription": "Runs and updates Kayak",
-    "longDescription": "Kayak runs as a Docker container. This app downloads it, starts it, shows it in a window, and installs new versions when they are published.",
+    "longDescription": "Kayak runs as a Docker container. This app downloads it, starts it, opens it in your browser, and installs new versions when they are published.",
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",

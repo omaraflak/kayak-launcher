@@ -17,17 +17,20 @@ type Stage =
     }
   | { kind: "starting"; headline: string; hint: string }
   | { kind: "updating"; message: string; percent: number }
-  | { kind: "ready" }
+  | { kind: "ready"; notice: Notice | null }
   | { kind: "failed"; headline: string; body: string }
   | { kind: "stopping" };
+
+/** Something said on the Ready screen instead of its usual words. */
+interface Notice {
+  headline: string;
+  body: string;
+}
 
 interface UpdateInfo {
   available: boolean;
   checking: boolean;
-  date: string | null;
   installed: string | null;
-  published: string | null;
-  error: string | null;
 }
 
 interface Snapshot {
@@ -39,24 +42,8 @@ const body = document.getElementById("body") as HTMLElement;
 const footer = document.getElementById("footer") as HTMLElement;
 const version = document.getElementById("version") as HTMLElement;
 
-/**
- * Version of a pending launcher update, once the backend has found one.
- *
- * The check runs in Rust rather than here, because this window is hidden as
- * soon as Kayak opens and an update found in it would never be seen. Rust also
- * shows it as a banner inside the Kayak window.
- */
-let launcherUpdate: string | null = null;
-
-/** Last known Kayak update state, so the footer can be redrawn on its own. */
-let lastUpdate: UpdateInfo = {
-  available: false,
-  checking: false,
-  date: null,
-  installed: null,
-  published: null,
-  error: null,
-};
+/** Clears a note from the footer once its time is up. */
+let noteTimer: number | undefined;
 
 function element<K extends keyof HTMLElementTagNameMap>(
   tag: K,
@@ -211,11 +198,21 @@ function render(stage: Stage): void {
       break;
     }
 
+    // Kayak lives in the browser now, so this screen is mostly seen by
+    // someone wondering whether closing the tab stopped it.
     case "ready": {
-      body.appendChild(headline("Kayak is running"));
-      body.appendChild(detail("Kayak is open in its own window."));
+      body.appendChild(headline(stage.notice?.headline ?? "Kayak is open in your browser"));
       body.appendChild(
-        actions(button("Show Kayak", () => void invoke("open_kayak"), true)),
+        detail(
+          stage.notice?.body ??
+            "Kayak keeps running in the background until you quit it. Closing the browser tab doesn't stop it.",
+        ),
+      );
+      body.appendChild(
+        actions(
+          button("Open Kayak", () => void invoke("open_kayak"), true),
+          button("Quit Kayak", () => void invoke("quit")),
+        ),
       );
       break;
     }
@@ -244,53 +241,34 @@ function render(stage: Stage): void {
 }
 
 function renderUpdate(info: UpdateInfo): void {
-  version.textContent = info.installed ? `Version ${info.installed}` : " ";
-
-  lastUpdate = info;
-  footer.textContent = "";
-
-  if (info.checking) {
-    footer.textContent = "Checking for updates…";
-    return;
+  version.textContent = info.installed ? `Version ${info.installed}` : " ";
+  // Updates install themselves, so the footer only ever says what is happening
+  // when someone asked: checking, and then a note with the answer.
+  if (noteTimer === undefined) {
+    footer.textContent = info.checking ? "Checking for updates…" : "";
   }
-  // One line and one button no matter what is out of date. The Kayak image
-  // and the launcher update through different channels, but that is plumbing:
-  // `install_update` applies everything that is pending, restarting the app
-  // if the launcher itself is part of it.
-  if (info.available || launcherUpdate !== null) {
-    footer.appendChild(
-      element(
-        "span",
-        undefined,
-        info.date
-          ? `An update is available (published ${info.date}). `
-          : "An update is available. ",
-      ),
-    );
-    footer.appendChild(button("Update Kayak", () => void invoke("install_update")));
-    return;
-  }
-  // A failed check is deliberately silent: being offline is normal and Kayak
-  // works regardless, so it is not worth alarming anyone about.
-  footer.textContent = "";
+}
+
+/** Shows a note, such as "Kayak is up to date.", for a few seconds. */
+function showNote(text: string, seconds: number): void {
+  window.clearTimeout(noteTimer);
+  footer.textContent = text;
+  noteTimer = window.setTimeout(() => {
+    noteTimer = undefined;
+    footer.textContent = "";
+  }, seconds * 1000);
 }
 
 async function main(): Promise<void> {
   await listen<Stage>("stage", (event) => render(event.payload));
   await listen<UpdateInfo>("update", (event) => renderUpdate(event.payload));
+  await listen<[string, number]>("note", (event) => showNote(...event.payload));
 
   // The boot sequence starts in Rust the moment the app launches, so the window
   // has to catch up with whatever already happened rather than assume step one.
   const snapshot = await invoke<Snapshot>("snapshot");
   render(snapshot.stage);
   renderUpdate(snapshot.update);
-
-  // Launcher updates are found in Rust and announced here, so this window and
-  // the banner inside the Kayak window agree without checking twice.
-  await listen<string>("launcher-update", (event) => {
-    launcherUpdate = event.payload;
-    renderUpdate(lastUpdate);
-  });
 }
 
 void main();

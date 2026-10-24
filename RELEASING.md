@@ -7,6 +7,11 @@ This is separate from releasing Kayak itself. Kayak updates through Docker Hub a
 should change often; the launcher updates through GitHub Releases and should barely
 change at all.
 
+When a launcher release depends on something new in Kayak's server, release Kayak first.
+Signing in by one-time code is the case in point: the launcher falls back to older ways
+for Kayak releases without it, but users only get the private sign-in once Kayak 1.6.0 is
+on Docker Hub, so that goes out before the launcher that relies on it.
+
 ## One-time setup
 
 ### 1. Create the repository on GitHub
@@ -92,9 +97,11 @@ Bump the version in all three places, and **make sure the tag you push matches t
 The tag names the release; `tauri.conf.json` is what Tauri writes into `latest.json`, and
 that is the only value installed launchers compare against. Tagging a commit `v1.0.2`
 while its `tauri.conf.json` still says `1.0.1` produces a release that *looks* newer on
-the releases page but that no installed launcher will ever offer, because the manifest
+the releases page but that no installed launcher will ever install, because the manifest
 reports a version they already have. Nothing warns you; the update just silently never
-appears.
+arrives. (The reverse mistake -- a manifest naming a newer version than its download
+contains -- is caught: a launcher installs such an update by itself once, and leaves it
+to Check for Updates… after that, instead of restarting into it at every launch.)
 
 Then:
 
@@ -110,8 +117,9 @@ parallel, one per Mac architecture; expect ten to twenty minutes.
 ## After the build
 
 The release publishes itself. Pushing the tag is the whole of it: the workflow attaches
-the installers and `latest.json`, marks the release latest, and installed launchers begin
-offering the update on their next check.
+the installers and `latest.json`, marks the release latest, and installed launchers
+install the update the next time they are opened, or straight away from **Kayak › Check
+for Updates…**.
 
 Confirm it went out with:
 

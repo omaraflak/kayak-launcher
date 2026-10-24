@@ -17,14 +17,11 @@ const TIMEOUT: Duration = Duration::from_secs(20);
 #[derive(Debug, Clone)]
 pub struct RemoteTag {
     pub digest: String,
-    /// ISO-8601 publish time, used to tell the user how new the update is.
-    pub published: Option<String>,
 }
 
 #[derive(Deserialize)]
 struct TagResponse {
     digest: Option<String>,
-    last_updated: Option<String>,
     images: Option<Vec<TagImage>>,
 }
 
@@ -52,7 +49,6 @@ pub fn latest_tag(repo: &str, tag: &str) -> Result<RemoteTag, String> {
 
     Ok(RemoteTag {
         digest: resolve_digest(&body)?,
-        published: body.last_updated,
     })
 }
 
@@ -78,35 +74,6 @@ pub fn short_digest(digest: &str) -> String {
     hex.chars().take(7).collect()
 }
 
-/// Renders an ISO-8601 timestamp as a plain date.
-///
-/// Non-technical users read "2 August 2026" more easily than a digest, and the
-/// publish date is the only version-like fact Docker Hub always provides.
-pub fn friendly_date(timestamp: &str) -> Option<String> {
-    const MONTHS: [&str; 12] = [
-        "January",
-        "February",
-        "March",
-        "April",
-        "May",
-        "June",
-        "July",
-        "August",
-        "September",
-        "October",
-        "November",
-        "December",
-    ];
-
-    let date = timestamp.split('T').next()?;
-    let mut parts = date.split('-');
-    let year: u32 = parts.next()?.parse().ok()?;
-    let month: usize = parts.next()?.parse().ok()?;
-    let day: u32 = parts.next()?.parse().ok()?;
-    let name = MONTHS.get(month.checked_sub(1)?)?;
-    Some(format!("{day} {name} {year}"))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,7 +81,6 @@ mod tests {
     fn body(digest: Option<&str>, image_digests: &[&str]) -> TagResponse {
         TagResponse {
             digest: digest.map(str::to_string),
-            last_updated: None,
             images: Some(
                 image_digests
                     .iter()
@@ -153,19 +119,5 @@ mod tests {
     fn shortens_digests_for_display() {
         assert_eq!(short_digest("sha256:1a2b3c4d5e6f"), "1a2b3c4");
         assert_eq!(short_digest("1a2b3c4d5e6f"), "1a2b3c4");
-    }
-
-    #[test]
-    fn formats_publish_dates() {
-        assert_eq!(
-            friendly_date("2026-08-02T11:04:22.123456Z").unwrap(),
-            "2 August 2026"
-        );
-    }
-
-    #[test]
-    fn rejects_timestamps_it_cannot_parse() {
-        assert!(friendly_date("not-a-date").is_none());
-        assert!(friendly_date("2026-13-01T00:00:00Z").is_none());
     }
 }

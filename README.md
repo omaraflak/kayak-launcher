@@ -1,9 +1,9 @@
 # Kayak Launcher
 
 Mac app that runs [Kayak](https://github.com/omaraflak/kayak) without a terminal. It
-finds Docker Desktop, downloads the images, starts the container, shows Kayak in a
-window, and offers one-click updates when a new version is published. On Apple Silicon it
-also serves MLX models on the GPU, which a container cannot reach.
+finds Docker Desktop, downloads the images, starts the container, opens Kayak in your
+browser, and keeps both itself and Kayak up to date. On Apple Silicon it also serves MLX
+models on the GPU, which a container cannot reach.
 
 Kayak supports macOS only, on Apple Silicon and Intel.
 
@@ -26,6 +26,21 @@ Kayak. Confirm with Touch ID or your password.
 
 Your data lives outside the container, in `~/Library/Application Support/Kayak/data`,
 and survives updates.
+
+## Using it
+
+Kayak opens in your default browser. It keeps running in the background until you quit
+the app: closing the browser tab does not stop it. Click the app in the Dock, or choose
+**Kayak › Open Kayak**, to open it again, and quit with **Kayak › Quit Kayak** (or the
+Dock). The app signs the browser in by itself, with a one-time code, so the key that keeps
+Kayak private stays out of the address. (Kayak 1.5.x has no codes; with it the app signs
+in with the key in the address, as those releases always did.)
+
+Updates install themselves, and never hold up opening Kayak. A new version of the app is
+installed when it is opened. A new version of Kayak is downloaded in the background while
+you use the current one, and used from the next launch; a first install is the only time
+Kayak waits for a download. **Kayak › Check for Updates…** applies whatever is available
+straight away.
 
 ## Development
 

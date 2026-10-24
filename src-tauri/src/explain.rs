@@ -18,9 +18,6 @@ pub const SERVER_EXITED: &str = "The Kayak server stopped right after starting";
 /// The Kayak server kept running but never answered its health check.
 pub const HEALTH_TIMEOUT: &str = "The Kayak server did not finish starting in time";
 
-/// Kayak is serving, but the window that shows it could not be created.
-pub const WINDOW_FAILED: &str = "The Kayak window could not be opened";
-
 /// A Docker command was still running when its time limit ran out.
 pub const DOCKER_UNRESPONSIVE: &str = "Docker Desktop did not respond in time";
 
@@ -51,7 +48,6 @@ pub enum Problem {
     /// The server stopped while Kayak was in use, rather than while starting.
     ServerStopped,
     HealthTimeout,
-    WindowFailed,
     Unknown,
 }
 
@@ -68,7 +64,6 @@ impl Problem {
             Self::DockerSlowToStart => "Docker Desktop didn't finish starting",
             Self::ServerStopped => "Kayak stopped unexpectedly",
             Self::HealthTimeout => "Kayak is taking longer than usual to start",
-            Self::WindowFailed => "Kayak is running, but its window didn't open",
             Self::ServerExited | Self::Unknown => "Kayak couldn't start",
         }
     }
@@ -95,7 +90,6 @@ impl Problem {
             }
             Self::ServerStopped => "Your work is saved. Click Try again to start Kayak again.",
             Self::HealthTimeout => "Your Mac may be busy. Click Try again to keep waiting.",
-            Self::WindowFailed => "Click Try again.",
             Self::ServerExited | Self::Unknown => {
                 "Click Try again. If it keeps happening, click Copy details and share them when \
                  you ask for help."
@@ -123,8 +117,6 @@ pub fn classify(raw: &str) -> Problem {
         Problem::ServerExited
     } else if has(HEALTH_TIMEOUT) {
         Problem::HealthTimeout
-    } else if has(WINDOW_FAILED) {
-        Problem::WindowFailed
     } else if has(DOCKER_WONT_OPEN) {
         Problem::DockerWontOpen
     } else if has(DOCKER_SLOW_TO_START) {
@@ -254,10 +246,6 @@ mod tests {
             Problem::ServerExited
         );
         assert_eq!(classify(HEALTH_TIMEOUT), Problem::HealthTimeout);
-        assert_eq!(
-            classify(&format!("{WINDOW_FAILED}: boom")),
-            Problem::WindowFailed
-        );
         assert_eq!(classify(DOCKER_SLOW_TO_START), Problem::DockerSlowToStart);
         assert_eq!(
             classify(&format!("{DOCKER_WONT_OPEN}: no open")),
@@ -303,7 +291,6 @@ mod tests {
             Problem::ServerExited,
             Problem::ServerStopped,
             Problem::HealthTimeout,
-            Problem::WindowFailed,
             Problem::Unknown,
         ];
         for problem in problems {

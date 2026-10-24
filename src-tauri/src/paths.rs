@@ -16,6 +16,28 @@ pub fn data_dir() -> PathBuf {
     base.join("Kayak").join("data")
 }
 
+/// A file of the launcher's own beside the data directory, in
+/// `~/Library/Application Support/Kayak`.
+///
+/// Beside it rather than in it: parts of the data directory are mounted into
+/// containers, and what the launcher keeps for itself is no business of theirs.
+pub fn beside_data(name: &str) -> PathBuf {
+    data_dir().with_file_name(name)
+}
+
+/// Writes one of those files, owner-only, creating the folder first: on a first
+/// launch nothing has made `~/Library/Application Support/Kayak` yet, and a
+/// write that fails there fails silently in effect, since nothing reads it back
+/// until the next launch.
+pub fn write_beside_data(name: &str, body: &[u8]) -> Result<(), String> {
+    let path = beside_data(name);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|err| format!("Could not create {}: {err}", parent.display()))?;
+    }
+    crate::control::replace_file(&path, body, 0o600)
+}
+
 /// Creates the data directory if absent.
 ///
 /// Done before anything else touches it: seeding copies the image's defaults
@@ -116,6 +138,13 @@ mod tests {
         assert!(data.join(".launcher").is_dir());
         assert!(data.join("settings.json").is_file());
         assert!(!staging.exists());
+    }
+
+    #[test]
+    fn the_launchers_own_files_sit_beside_the_data_directory() {
+        let file = beside_data("access-key");
+        assert_eq!(file.parent(), data_dir().parent());
+        assert_eq!(file.file_name().unwrap(), "access-key");
     }
 
     #[test]

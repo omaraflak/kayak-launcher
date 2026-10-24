@@ -2,14 +2,15 @@
 //!
 //! Kayak ships as a Docker image. This app exists so that running it never
 //! requires a terminal: it finds Docker, downloads the images, starts the
-//! server, shows Kayak in a desktop window, and watches Docker Hub so a new
-//! release can be installed from a button rather than a `docker pull`.
+//! server, opens Kayak in the browser, and keeps both itself and Kayak up to
+//! date without anyone having to press a button.
 
 mod access;
 mod config;
 mod control;
 mod docker;
 mod explain;
+mod images;
 mod logs;
 mod metal;
 mod paths;
@@ -24,11 +25,7 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::menu::{AboutMetadata, Menu, MenuBuilder, MenuItemBuilder, SubmenuBuilder};
-use tauri::{
-    webview::DownloadEvent, AppHandle, Emitter, Manager, RunEvent, Url, WebviewUrl,
-    WebviewWindowBuilder, WindowEvent,
-};
-use tauri_plugin_dialog::{DialogExt, MessageDialogKind};
+use tauri::{AppHandle, Emitter, Manager, RunEvent, WindowEvent};
 use tauri_plugin_opener::OpenerExt;
 use tauri_plugin_updater::UpdaterExt;
 
@@ -36,26 +33,25 @@ use docker::{ContainerState, Daemon, DesktopLaunch};
 use explain::Problem;
 
 const LAUNCHER_WINDOW: &str = "launcher";
-const KAYAK_WINDOW: &str = "kayak";
-
-/// Injected into the Kayak window so the launcher can draw an update banner
-/// over a page it does not control.
-const BANNER_JS: &str = include_str!("banner.js");
-
-/// Prefix for the fake navigations the injected banner uses to call back in.
-const ACTION_PREFIX: &str = "/__launcher/";
 
 /// Gap between background update checks.
 const UPDATE_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 
-/// Limit on asking GitHub whether a newer app exists. Without one, a check that
-/// hung stalled the update watcher, and with it every later check, for good.
+/// Limit on asking GitHub whether a newer app exists, when the user asked.
 const UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// The same limit at launch, where every second of it is a second before Kayak
+/// opens. Offline, the check fails at once and the launch carries on.
+const LAUNCH_UPDATE_CHECK_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// How long the app's own update download may receive nothing before it is
-/// abandoned. A stalled download used to leave a progress screen over Kayak
-/// with no way past it.
+/// abandoned, so a stalled download ends instead of holding up Kayak for good.
 const LAUNCHER_DOWNLOAD_STALL: Duration = Duration::from_secs(60);
+
+/// The longest the app's own update may hold up a launch, however steadily it
+/// is downloading. Past it, Kayak starts on the app already installed, and the
+/// update is tried again at the next launch.
+const LAUNCH_APP_UPDATE_LIMIT: Duration = Duration::from_secs(2 * 60);
 
 /// How long Docker Desktop is given to start answering after being opened.
 /// Its first start after installing, or after a macOS update, is slow.
@@ -95,7 +91,18 @@ const PORT_ATTEMPTS: u32 = 3;
 /// Lines of the launcher log "Copy details" puts on the clipboard.
 const DETAIL_LINES: usize = 200;
 
-const MENU_RELOAD: &str = "reload";
+/// How long "Kayak is up to date." stays in the launcher window.
+const NOTE_SECONDS: u64 = 4;
+
+/// The tab left open across a restart into an app update. See
+/// [`remember_open_tab`].
+const OPEN_TAB_FILE: &str = "open-tab-port";
+
+/// The app update last installed, by version. See [`retry_launcher_update`].
+const LAUNCHER_ATTEMPT_FILE: &str = "app-update-attempt";
+
+const MENU_OPEN: &str = "open-kayak";
+const MENU_CHECK_UPDATES: &str = "check-for-updates";
 const MENU_SHOW_LOG: &str = "show-log";
 
 /// Locks a mutex, carrying on with its data if another thread panicked while
@@ -135,12 +142,17 @@ pub enum Stage {
         headline: String,
         hint: String,
     },
-    /// An update is being applied with no Kayak window to show it in.
+    /// Kayak, or this app, is being updated.
     Updating {
         message: String,
         percent: i32,
     },
-    Ready,
+    /// Kayak is serving and has been opened in the browser. `notice` replaces
+    /// the usual words when there is something to say -- an update that did
+    /// not go through, or a browser that would not open.
+    Ready {
+        notice: Option<Notice>,
+    },
     Failed {
         headline: String,
         body: String,
@@ -148,16 +160,50 @@ pub enum Stage {
     Stopping,
 }
 
-/// What is known about the published version versus the installed one.
+/// Something worth saying on the Ready screen instead of its usual words.
+#[derive(Debug, Clone, Serialize)]
+pub struct Notice {
+    headline: String,
+    body: String,
+}
+
+impl Notice {
+    fn new(headline: &str, body: impl Into<String>) -> Self {
+        Self {
+            headline: headline.to_string(),
+            body: body.into(),
+        }
+    }
+
+    /// A Kayak update failed, and the previous version is serving again.
+    fn update_failed(error: &str) -> Self {
+        Self::new(explain::UPDATE_FAILED, explain::update_failure(error))
+    }
+
+    /// Kayak is serving again where its open tab expects it. Said rather than
+    /// "open in your browser", because the tab may have been closed since.
+    fn reconnecting() -> Self {
+        Self::new(
+            "Kayak is running again",
+            "Its tab in your browser reconnects by itself. If you closed it, click Open Kayak.",
+        )
+    }
+
+    /// Kayak is serving, but the browser could not be sent to it.
+    fn browser_failed() -> Self {
+        Self::new(
+            "Couldn't open Kayak in your browser",
+            "Click Open Kayak to try again.",
+        )
+    }
+}
+
+/// What is known about the installed Kayak versus the published one.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct UpdateInfo {
     pub available: bool,
     pub checking: bool,
-    /// Publish date of the available version, already formatted for display.
-    pub date: Option<String>,
     pub installed: Option<String>,
-    pub published: Option<String>,
-    pub error: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -166,17 +212,31 @@ pub struct Snapshot {
     update: UpdateInfo,
 }
 
-/// A message drawn over Kayak that has to outlive a reload of the page.
+/// The browser tab Kayak was opened in, as far as the launcher can know it.
 ///
-/// A failed update can end with the window being pointed at a restarted
-/// server, which reloads the page and wipes anything drawn on it; held here,
-/// the message is drawn again when the new page announces itself.
-#[derive(Debug, Clone, Serialize)]
-struct Notice {
-    title: String,
-    message: String,
-    /// Label of the button that closes it.
-    dismiss: String,
+/// A server that comes back on the same port is left to the tab already
+/// showing it, which reconnects by itself; opening another would only leave a
+/// duplicate. But only a tab that is still signed in: one signed in with a key
+/// the server no longer has, or opened before the server had one, would be
+/// left on a page asking to sign in.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OpenTab {
+    port: u16,
+    /// What the tab was signed in with, by [`fingerprint`]; None when the
+    /// server needed no signing in.
+    signed_in_as: Option<String>,
+}
+
+/// Enough of a key to tell it apart from another, without writing the key
+/// itself anywhere it is not already.
+fn fingerprint(key: &str) -> String {
+    key.chars().take(12).collect()
+}
+
+/// Whether the tab already open will reconnect, signed in, to a server on
+/// `port` that requires `serving` -- a key fingerprint, or None for none.
+fn tab_reconnects(tab: Option<&OpenTab>, port: u16, serving: Option<&str>) -> bool {
+    tab.is_some_and(|tab| tab.port == port && tab.signed_in_as.as_deref() == serving)
 }
 
 /// A GPU start that failed, and the request it was the answer to.
@@ -206,6 +266,13 @@ pub struct Launcher {
     stage: Mutex<Stage>,
     update: Mutex<UpdateInfo>,
     port: Mutex<Option<u16>>,
+    /// The key the running server requires, as it was when the launcher
+    /// started it or checked it. Remembered rather than asked of Docker again
+    /// at every opening, because a Docker call that fails for a moment would
+    /// then open Kayak signed out.
+    serving_key: Mutex<Option<String>>,
+    /// The tab Kayak was last opened in. See [`OpenTab`].
+    opened_tab: Mutex<Option<OpenTab>>,
     /// The Metal inference server, when one is running. Native to the host
     /// rather than containerised, because Metal has no passthrough into Docker.
     metal: Mutex<Option<metal::Server>>,
@@ -216,14 +283,10 @@ pub struct Launcher {
     /// Serialises writes of the status file, so the final "stopped" written
     /// while quitting cannot be overwritten by a reconcile pass under way.
     status_write: Mutex<()>,
-    /// A launcher update waiting to be installed, held so the button in the
-    /// Kayak window can apply the one already found rather than checking again.
-    launcher_update: Mutex<Option<tauri_plugin_updater::Update>>,
-    notice: Mutex<Option<Notice>>,
     /// What the last failed start was, which decides what Try again does first.
     last_problem: Mutex<Option<Problem>>,
     /// Set when the running server must be replaced rather than reconnected
-    /// to at the next start, because it stopped answering.
+    /// to at the next start: it stopped answering, or it is the old version.
     recreate_next: AtomicBool,
     /// Set once the app has begun quitting. Every loop and sequence checks it,
     /// so nothing new is started underneath the shutdown.
@@ -231,9 +294,18 @@ pub struct Launcher {
     /// Set once everything has been stopped, so it happens only once whichever
     /// way the app is quitting.
     stopped: AtomicBool,
-    /// Guards the boot and update sequences so a double-click cannot run two
-    /// `docker run` calls against the same container name.
+    /// Guards the start and update sequences so that two of them -- a click
+    /// and a background check, say -- cannot run `docker run` against the same
+    /// container name at once.
     busy: AtomicBool,
+    /// Set while the busy flag is held only for a background download, which
+    /// gives way to anything the user asks for. See [`claim`].
+    prefetching: AtomicBool,
+    /// Stops a background download: raised by quitting, and by [`claim`].
+    prefetch_cancel: AtomicBool,
+    /// Whether this run has been through its launch: the app's own update is
+    /// applied only then, and a newer Kayak is fetched before the first start.
+    launched: AtomicBool,
     /// Whether the GPU control channel has been set up for this launch.
     bridge_started: AtomicBool,
 }
@@ -244,17 +316,20 @@ impl Launcher {
             stage: Mutex::new(Stage::Checking),
             update: Mutex::new(UpdateInfo::default()),
             port: Mutex::new(None),
+            serving_key: Mutex::new(None),
+            opened_tab: Mutex::new(None),
             metal: Mutex::new(None),
             metal_failure: Mutex::new(None),
             installer: Mutex::new(None),
             status_write: Mutex::new(()),
-            launcher_update: Mutex::new(None),
-            notice: Mutex::new(None),
             last_problem: Mutex::new(None),
             recreate_next: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
             stopped: AtomicBool::new(false),
             busy: AtomicBool::new(false),
+            prefetching: AtomicBool::new(false),
+            prefetch_cancel: AtomicBool::new(false),
+            launched: AtomicBool::new(false),
             bridge_started: AtomicBool::new(false),
         }
     }
@@ -303,25 +378,56 @@ fn set_update(app: &AppHandle, state: &Launcher, update: UpdateInfo) {
     let _ = app.emit("update", update);
 }
 
-fn kayak_window_visible(app: &AppHandle) -> bool {
-    app.get_webview_window(KAYAK_WINDOW)
-        .is_some_and(|window| window.is_visible().unwrap_or(false))
+/// Claims the busy flag for something that has to happen now, setting aside a
+/// background download that holds it.
+///
+/// A background download only prepares the next launch, and making the user
+/// wait for it -- or ignoring their click -- would put it first. It is stopped
+/// where it is, to be picked up again later. With `wait`, a start or an update
+/// already under way is waited for rather than given up on, so nothing the user
+/// asked for is dropped; without, None means one is under way.
+fn claim(state: &Arc<Launcher>, wait: bool) -> Option<BusyGuard> {
+    loop {
+        if let Some(guard) = BusyGuard::acquire(state) {
+            return Some(guard);
+        }
+        if stopping(state) {
+            return None;
+        }
+        if state.prefetching.load(Ordering::SeqCst) {
+            if !state.prefetch_cancel.swap(true, Ordering::SeqCst) {
+                logs::record("update", "setting the background download aside");
+            }
+        } else if !wait {
+            return None;
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
-/// Brings the launcher window forward and hides Kayak's.
+/// Brings the launcher window forward.
 ///
-/// Used whenever Kayak cannot be used: the Kayak window would otherwise sit on
-/// a dead or blank page with nothing to say why, while the explanation was in
-/// a window the user could not see.
+/// Used whenever Kayak cannot be used, and whenever the launcher has something
+/// to show: the browser tab cannot say why Kayak went away, so the launcher
+/// window does.
 fn surface_launcher(app: &AppHandle) {
-    if let Some(window) = app.get_webview_window(KAYAK_WINDOW) {
-        let _ = window.hide();
-    }
     if let Some(window) = app.get_webview_window(LAUNCHER_WINDOW) {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
     }
+}
+
+fn hide_launcher(app: &AppHandle) {
+    if let Some(window) = app.get_webview_window(LAUNCHER_WINDOW) {
+        let _ = window.hide();
+    }
+}
+
+/// Shows a short note in the launcher window's footer, such as "Kayak is up to
+/// date." The window takes it away again by itself.
+fn note(app: &AppHandle, text: &str) {
+    let _ = app.emit("note", (text, NOTE_SECONDS));
 }
 
 /// Shows a failure in the launcher window, in words rather than error text.
@@ -475,17 +581,33 @@ fn record_image_identity(image: &str, how: &str) {
     );
 }
 
-/// Brings Kayak up, from a cold machine to a served UI.
+/// Brings Kayak up, from a cold machine to Kayak open in the browser.
+///
+/// The first run of it at launch also brings things up to date: the app itself
+/// before anything else, and Kayak before it is started, so the version that
+/// opens is the newest one there is -- with nothing for the user to do.
 fn boot(app: AppHandle, state: Arc<Launcher>) {
-    let Some(_guard) = BusyGuard::acquire(&state) else {
+    // Not waited for: a start already under way is doing exactly this, with
+    // its progress on screen.
+    let Some(guard) = claim(&state, false) else {
         return;
     };
     if stopping(&state) {
         return;
     }
+    let at_launch = !state.launched.swap(true, Ordering::SeqCst);
 
     logs::record("boot", "starting up");
     set_stage(&app, &state, Stage::Checking);
+
+    // First, and needing no Docker: a release of this app that cannot start
+    // Kayak must still be able to replace itself with the one that can.
+    if at_launch {
+        update_app_at_launch(&app, &state);
+        if stopping(&state) {
+            return;
+        }
+    }
 
     if !docker::is_installed() {
         logs::record("boot", "docker CLI not found on this machine");
@@ -497,24 +619,24 @@ fn boot(app: AppHandle, state: Arc<Launcher>) {
         return;
     }
 
-    // A server that stopped right after starting is most often a broken
-    // release, and the fix for one is the next release. Without this, Try
-    // again started the same broken version forever.
-    let mut superseded = Vec::new();
-    if lock(&state.last_problem).take() == Some(Problem::ServerExited) {
-        match fetch_newer_kayak(&app, &state) {
-            Ok(replaced) => superseded = replaced,
-            Err(error) => {
-                if !stopping(&state) {
-                    fail(&app, &state, &error);
-                }
+    // A launch never waits for a download: a newer Kayak downloaded in the
+    // background is simply what starts, and one not downloaded yet is fetched
+    // in the background once Kayak is open, for the next launch. Only Try again
+    // after a server that stopped right after starting -- most often a broken
+    // release, for which the fix is the next release -- fetches it first.
+    let retrying_crash = lock(&state.last_problem).take() == Some(Problem::ServerExited);
+    if retrying_crash {
+        if let Err(error) = refresh_kayak(&app, &state) {
+            // Not a reason to stop: the version already installed may yet run.
+            logs::record("update", &format!("could not download the newer Kayak: {error}"));
+            if stopping(&state) {
                 return;
             }
         }
     }
 
-    let port = match start_server(&app, &state) {
-        Ok(port) => port,
+    let (port, rolled_back) = match start_with_rollback(&app, &state) {
+        Ok(started) => started,
         Err(error) => {
             if !stopping(&state) {
                 fail(&app, &state, &error);
@@ -524,18 +646,18 @@ fn boot(app: AppHandle, state: Arc<Launcher>) {
     };
     *lock(&state.port) = Some(port);
     logs::record("boot", &format!("kayak is serving on port {port}"));
-    remove_superseded(&superseded);
 
-    if !present_kayak(&app, &state, port) {
-        return;
-    }
+    kayak_is_up(&app, &state, port, rolled_back.as_deref().map(Notice::update_failed));
+    drop(guard);
 
-    // The check made when the launcher opened could not read the installed
-    // version if Docker Desktop was not running yet, which left the About panel
-    // and the update banner a check behind.
-    if lock(&state.update).installed.is_none() {
-        thread::spawn(move || check_for_updates(app, state));
-    }
+    // Read now that Kayak runs: the version for the About panel, and what Kayak
+    // shows as installed. Then, after a launch, the newer Kayak if there is one.
+    thread::spawn(move || {
+        check_for_updates(app, state.clone());
+        if at_launch {
+            prefetch_kayak(&state);
+        }
+    });
 }
 
 /// Makes sure Docker Desktop is answering, opening it if it is not running.
@@ -603,31 +725,6 @@ fn ensure_docker(app: &AppHandle, state: &Launcher) -> bool {
     false
 }
 
-/// Downloads the published Kayak when it differs from the installed one,
-/// returning the images it replaced so they can be removed once Kayak runs.
-///
-/// Docker Hub being unreachable is not an error here: the retry can still go
-/// ahead with what is installed.
-fn fetch_newer_kayak(app: &AppHandle, state: &Launcher) -> Result<Vec<String>, String> {
-    let installed = docker::image_digest(&config::server_image());
-    let remote = match registry::latest_tag(config::SERVER_REPO, config::TAG) {
-        Ok(remote) => remote,
-        Err(error) => {
-            logs::record("boot", &format!("could not check for a newer Kayak: {error}"));
-            return Ok(Vec::new());
-        }
-    };
-    if installed.as_deref() == Some(remote.digest.as_str()) {
-        logs::record("boot", "the installed Kayak is the published one");
-        return Ok(Vec::new());
-    }
-
-    logs::record("boot", "a newer Kayak is published; downloading it before trying again");
-    let previous = Previous::note();
-    ensure_images(app, state, true)?;
-    Ok(previous.ids())
-}
-
 /// Starts the host side of Kayak's GPU support, once per launch.
 ///
 /// Waits for Kayak to be serving because the control channel lives in the data
@@ -679,9 +776,10 @@ fn start_server(app: &AppHandle, state: &Launcher) -> Result<u16, String> {
         // A server that should require the access key and was started without it
         // -- by a launcher from before keys -- is replaced, or it stays open to
         // every container until the next update.
-        let missing_key = server_key(&config::server_image()).is_some_and(|key| {
-            !docker::container_has_env(config::CONTAINER_NAME, access::ENV_NAME, &key)
+        let holds_key = access::key().filter(|key| {
+            docker::container_has_env(config::CONTAINER_NAME, access::ENV_NAME, key)
         });
+        let missing_key = server_key(&config::server_image()).is_some() && holds_key.is_none();
         if missing_key {
             logs::record("boot", "the running server does not require the access key; replacing it");
         } else if should_reuse(running_from.as_deref(), current.as_deref()) {
@@ -696,7 +794,10 @@ fn start_server(app: &AppHandle, state: &Launcher) -> Result<u16, String> {
                 );
                 match wait_for_health(port, Duration::from_secs(config::HEALTH_TIMEOUT_SECS), state)
                 {
-                    Ok(()) => return Ok(port),
+                    Ok(()) => {
+                        *lock(&state.serving_key) = holds_key;
+                        return Ok(port);
+                    }
                     // A server that was already running and still does not
                     // answer is hung, not starting; waiting on it again would
                     // only repeat the wait. It is replaced instead.
@@ -740,12 +841,8 @@ fn start_server(app: &AppHandle, state: &Launcher) -> Result<u16, String> {
 
 const STARTING_KAYAK: &str = "Starting Kayak";
 
-/// Says what a start is doing, in the launcher window -- unless Kayak's own
-/// window is up, where an update is already showing its progress.
+/// Says what a start is doing, in the launcher window.
 fn show_step(app: &AppHandle, state: &Launcher, headline: &str, hint: &str) {
-    if kayak_window_visible(app) {
-        return;
-    }
     set_stage(
         app,
         state,
@@ -819,7 +916,10 @@ fn launch_container(
             access_key: key.as_deref(),
         });
         match launched {
-            Ok(()) => break port,
+            Ok(()) => {
+                *lock(&state.serving_key) = key.clone();
+                break port;
+            }
             Err(error) if docker::is_port_clash(&error) && attempt < PORT_ATTEMPTS => {
                 logs::record("boot", &format!("port {port} was taken after all ({error}); trying another"));
                 // The failed run still created the container, which holds the name.
@@ -860,492 +960,441 @@ fn should_reuse(container_image: Option<&str>, current_image: Option<&str>) -> b
     }
 }
 
-/// A token unique to this moment, for addresses no cache can hold.
-fn fresh_token() -> String {
-    // The counter makes consecutive calls distinct even within one clock
-    // millisecond, so no two navigations can ever share a cache entry.
-    static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-    let millis = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|elapsed| elapsed.as_millis())
-        .unwrap_or(0);
-    format!("{millis}-{sequence}")
-}
-
-/// A copy of `url` that no cache can already hold an entry for.
-///
-/// Navigations go through the webview's HTTP cache, and an index.html cached
-/// before Kayak sent cache headers stays "fresh" by heuristic for a long time
-/// -- long enough that opening or updating the app showed a previous release's
-/// UI without the webview ever asking the running server. A query string
-/// unique to this moment cannot match any stored entry, so the app shell is
-/// always fetched from the server that is actually running.
-fn cache_busted(url: &str) -> String {
-    format!("{url}/?fresh={}", fresh_token())
-}
-
-/// The page the window is on, at an address no cache can hold.
-///
-/// For reloading in place: the user stays on the page they were on, and only
-/// the cache-busting query changes.
-fn refreshed(url: &Url) -> Url {
-    let kept: Vec<(String, String)> = url
-        .query_pairs()
-        .filter(|(key, _)| key != "fresh")
-        .map(|(key, value)| (key.into_owned(), value.into_owned()))
-        .collect();
-    let mut fresh = url.clone();
-    fresh
-        .query_pairs_mut()
-        .clear()
-        .extend_pairs(kept)
-        .append_pair("fresh", &fresh_token());
-    fresh
-}
-
-/// Asks where to save a file Kayak offered for download, then saves it there.
-///
-/// With no handler registered, the webview cancels a `download` link outright, so
-/// pressing Download in Kayak did nothing at all. The webview's own download is
-/// declined and the file fetched here instead: WebKit wants the destination decided
-/// synchronously, inside a callback on the main thread, which is exactly where a
-/// Save panel cannot be shown without stalling the page behind it.
-fn handle_download(app: &AppHandle, event: DownloadEvent<'_>) -> bool {
-    let DownloadEvent::Requested { url, destination } = event else {
-        return true;
-    };
-
-    // A blob: or data: URL exists only inside the page, so only the webview can
-    // save it; it lands in Downloads under the name the page offered.
-    if !matches!(url.scheme(), "http" | "https") {
-        logs::record("download", &format!("saving a {} url to Downloads", url.scheme()));
-        return true;
-    }
-
-    let suggested = destination
-        .file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| "download".to_string());
-    let mut dialog = app.dialog().file().set_file_name(suggested);
-    if let Some(folder) = destination.parent() {
-        dialog = dialog.set_directory(folder);
-    }
-    // Attached to the Kayak window as a sheet, the way a Mac app asks.
-    if let Some(window) = app.get_webview_window(KAYAK_WINDOW) {
-        dialog = dialog.set_parent(&window);
-    }
-
-    let app = app.clone();
-    let url = url.to_string();
-    dialog.save_file(move |chosen| {
-        let Some(path) = chosen.and_then(|chosen| chosen.into_path().ok()) else {
-            return; // Cancelled.
-        };
-        thread::spawn(move || match save_url(&url, &path, access::key().as_deref()) {
-            Ok(()) => logs::record("download", &format!("saved {url} to {}", path.display())),
-            Err(error) => {
-                // The reason stays in the log; the dialog says what to do.
-                logs::record("download", &error);
-                app.dialog()
-                    .message("Check that there's enough free space and try again.")
-                    .title("Couldn't save the file")
-                    .kind(MessageDialogKind::Error)
-                    .show(|_| {});
-            }
-        });
-    });
-    false
-}
-
-/// Fetches a URL into a file, leaving nothing behind if it fails part-way.
-///
-/// `key` is sent as the access key when the file is on Kayak's own server: it
-/// is fetched here rather than by the window, so the session the window holds
-/// is not sent along, and the key stands in for it.
-fn save_url(url: &str, path: &Path, key: Option<&str>) -> Result<(), String> {
-    let mut request = ureq::get(url);
-    if let (Some(key), true) = (key, is_loopback_url(url)) {
-        request = request.set(access::HEADER_NAME, key);
-    }
-    let response = request
-        .call()
-        .map_err(|error| format!("Could not download the file: {error}"))?;
-    let written = std::fs::File::create(path).and_then(|mut file| {
-        std::io::copy(&mut response.into_reader(), &mut file).map(|_| ())
-    });
-    written.map_err(|error| {
-        let _ = std::fs::remove_file(path);
-        format!("Could not write {}: {error}", path.display())
-    })
-}
-
 /// The access key a server started from `image` should require, if any.
 ///
 /// None when this Mac has no key, or when the image predates keys: its server
-/// could not sign the window in, and requiring a key it cannot hand out would
+/// could not sign the browser in, and requiring a key it cannot hand out would
 /// lock the user out of Kayak.
 fn server_key(image: &str) -> Option<String> {
     let key = access::key()?;
     access::image_supports(docker::image_version(image).as_deref()).then_some(key)
 }
 
-/// Whether a URL points at this Mac, which is where Kayak's server is.
-fn is_loopback_url(url: &str) -> bool {
-    url.parse::<Url>()
-        .ok()
-        .and_then(|url| url.host_str().map(str::to_string))
-        .is_some_and(|host| matches!(host.as_str(), "127.0.0.1" | "localhost" | "[::1]"))
-}
-
-/// Puts Kayak on screen, served from `port`, and steps the launcher aside.
-/// Returns false when the window could not be shown, having said so.
+/// Kayak is serving on `port`: shows it in the browser, and steps the launcher
+/// aside.
 ///
 /// Every path that brings Kayak up ends here, so this is also where the GPU
-/// control channel is connected. Done only on a normal start, an update
-/// started from the launcher brought Kayak up with nothing answering its GPU
-/// requests, and every GPU model failed.
-fn present_kayak(app: &AppHandle, state: &Arc<Launcher>, port: u16) -> bool {
+/// control channel is connected. When that was done only on a normal start, an
+/// update brought Kayak up with nothing answering its GPU requests, and every
+/// GPU model failed.
+fn kayak_is_up(app: &AppHandle, state: &Arc<Launcher>, port: u16, notice: Option<Notice>) {
     connect_gpu_bridge(state);
-    set_stage(app, state, Stage::Ready);
-    // Signed in only when the server actually holds the key: one that does not
-    // has no sign-in address, and sending the window there would show an error.
-    let key = access::key().filter(|key| {
-        docker::container_has_env(config::CONTAINER_NAME, access::ENV_NAME, key)
-    });
-    if let Err(error) = show_kayak(app, &format!("http://127.0.0.1:{port}"), key.as_deref()) {
-        fail(app, state, &format!("{}: {error}", explain::WINDOW_FAILED));
-        return false;
+
+    let serving = lock(&state.serving_key).as_deref().map(fingerprint);
+    let reconnects = tab_reconnects(lock(&state.opened_tab).as_ref(), port, serving.as_deref());
+    if reconnects {
+        logs::record("boot", "kayak is back where the open tab expects it; it reconnects by itself");
+        // The launcher cannot know whether the tab is still open, so it does not
+        // claim it is; it says what happens to it, and how to get one if not.
+        let notice = notice.unwrap_or_else(Notice::reconnecting);
+        set_stage(app, state, Stage::Ready { notice: Some(notice) });
+        return;
     }
-    // The launcher window has done its job; from here the update banner inside
-    // the Kayak window is the only launcher surface the user needs.
-    if let Some(window) = app.get_webview_window(LAUNCHER_WINDOW) {
-        let _ = window.hide();
+
+    set_stage(
+        app,
+        state,
+        Stage::Ready {
+            notice: notice.clone(),
+        },
+    );
+    match open_in_browser(app, state, port) {
+        // Stepped aside only when there is nothing more to say; a notice stays
+        // in view.
+        Ok(()) if notice.is_none() => hide_launcher(app),
+        Ok(()) => surface_launcher(app),
+        Err(error) => {
+            logs::record("open", &error);
+            set_stage(
+                app,
+                state,
+                Stage::Ready {
+                    notice: Some(Notice::browser_failed()),
+                },
+            );
+            surface_launcher(app);
+        }
     }
-    true
 }
 
-/// Opens (or focuses) the window that shows Kayak itself.
+/// Opens Kayak, served at `port`, in the default browser, signed in.
 ///
-/// A window that already exists is pointed at `url` again rather than just
-/// shown: it was hidden because Kayak stopped, so the page it holds belongs to
-/// a server that is gone, and the server that replaced it may be on another
-/// port.
-fn show_kayak(app: &AppHandle, url: &str, key: Option<&str>) -> Result<(), String> {
-    let page = cache_busted(url);
-    let parsed: Url = match key {
-        // The server signs the window in, then sends it on to the page.
-        Some(key) => access::entry_url(url, &page[url.len()..], key)?,
-        None => page.parse().map_err(|err| format!("Could not parse {url}: {err}"))?,
+/// Each call signs in afresh: a sign-in code is good for one use, and asking
+/// the server for one is cheap. When signing in fails even so, the start page is
+/// opened anyway rather than nothing: the browser may still hold a session from
+/// before, and if not, the page says how to get one. Makes a request to the
+/// server, so it is never called on the main thread.
+fn open_in_browser(app: &AppHandle, state: &Launcher, port: u16) -> Result<(), String> {
+    let base = format!("http://127.0.0.1:{port}");
+    let key = lock(&state.serving_key).clone();
+    let signed_in = access::sign_in_address(&base, key.as_deref()).or_else(|error| {
+        // A server that has only just started can be a moment from answering.
+        logs::record("open", &format!("{error}; asking again"));
+        thread::sleep(Duration::from_secs(1));
+        access::sign_in_address(&base, key.as_deref())
+    });
+    let (address, tab) = match signed_in {
+        Ok(address) => {
+            let tab = OpenTab {
+                port,
+                signed_in_as: key.as_deref().map(fingerprint),
+            };
+            (address, Some(tab))
+        }
+        Err(error) => {
+            logs::record("open", &format!("{error}; opening the start page instead"));
+            (access::plain_address(&base)?, None)
+        }
     };
 
-    if let Some(window) = app.get_webview_window(KAYAK_WINDOW) {
-        window.navigate(parsed).map_err(|err| format!("{err}"))?;
-        let _ = window.show();
-        let _ = window.set_focus();
-        return Ok(());
-    }
-
-    let navigation_handle = app.clone();
-    let close_handle = app.clone();
-    let download_handle = app.clone();
-
-    WebviewWindowBuilder::new(app, KAYAK_WINDOW, WebviewUrl::External(parsed))
-        .title("Kayak")
-        .inner_size(1280.0, 860.0)
-        .min_inner_size(900.0, 600.0)
-        .center()
-        .initialization_script(BANNER_JS)
-        .on_download(move |_webview, event| handle_download(&download_handle, event))
-        .on_navigation(move |url| {
-            let Some(action) = url.path().strip_prefix(ACTION_PREFIX) else {
-                // A scheme this window cannot render, such as mailto:. Kayak
-                // sets `location.href` for these, which is not a click and so
-                // never reaches the page's own link handling; left alone the
-                // webview simply refuses to go there and nothing happens.
-                if !matches!(url.scheme(), "http" | "https") {
-                    open_externally(&navigation_handle, url.as_str());
-                    return false;
-                }
-                return true;
-            };
-            // The query carries an argument for actions that need one, such as
-            // the URL to hand to the operating system.
-            let query: std::collections::HashMap<String, String> = url
-                .query_pairs()
-                .map(|(key, value)| (key.to_string(), value.to_string()))
-                .collect();
-            handle_banner_action(&navigation_handle, action.to_string(), query);
-            // Cancelled: these paths are a message channel, not a real page.
-            false
-        })
-        .build()
-        .map_err(|err| format!("{err}"))?;
-
-    if let Some(window) = app.get_webview_window(KAYAK_WINDOW) {
-        window.on_window_event(move |event| {
-            // Closing Kayak quits, rather than leaving a hidden launcher window
-            // and an orphaned container behind. The close is held off while the
-            // container stops so the window can say what is happening.
-            if let WindowEvent::CloseRequested { api, .. } = event {
-                let Some(state) = close_handle.try_state::<Arc<Launcher>>() else {
-                    return;
-                };
-                api.prevent_close();
-                begin_shutdown(close_handle.clone(), state.inner().clone());
-            }
-        });
-    }
-
+    app.opener()
+        .open_url(address.as_str(), None::<&str>)
+        // The address can carry a sign-in code, which has no business in a log.
+        .map_err(|err| {
+            let reason = err.to_string().replace(address.as_str(), "the sign-in address");
+            format!("Could not open the browser: {reason}")
+        })?;
+    // A tab that could not be signed in is not one to leave to reconnect.
+    *lock(&state.opened_tab) = tab;
+    logs::record("open", "opened Kayak in the browser");
     Ok(())
 }
 
-/// Closing the launcher window quits, the same as closing Kayak's.
-///
-/// The launcher is the only window on screen whenever Kayak cannot be used --
-/// and then the Kayak window is hidden behind it rather than closed -- so
-/// closing it is the user saying they are done. Left to the default it simply
-/// vanished, while the hidden window kept the app, and Kayak, running.
-fn watch_launcher_window(app: &AppHandle) {
-    let Some(window) = app.get_webview_window(LAUNCHER_WINDOW) else {
-        return;
-    };
-    let handle = app.clone();
-    window.on_window_event(move |event| {
-        if let WindowEvent::CloseRequested { api, .. } = event {
-            let Some(state) = handle.try_state::<Arc<Launcher>>() else {
-                return;
-            };
-            api.prevent_close();
-            begin_shutdown(handle.clone(), state.inner().clone());
+/// Opens Kayak in the browser because the user asked -- from the Dock, the menu
+/// or the launcher window -- or, if Kayak is not ready, shows why instead.
+fn open_kayak_now(app: AppHandle, state: Arc<Launcher>) {
+    thread::spawn(move || {
+        let ready = matches!(*lock(&state.stage), Stage::Ready { .. });
+        let port = *lock(&state.port);
+        let (true, Some(port)) = (ready, port) else {
+            surface_launcher(&app);
+            return;
+        };
+        match open_in_browser(&app, &state, port) {
+            Ok(()) => hide_launcher(&app),
+            Err(error) => {
+                logs::record("open", &error);
+                set_stage(
+                    &app,
+                    &state,
+                    Stage::Ready {
+                        notice: Some(Notice::browser_failed()),
+                    },
+                );
+                surface_launcher(&app);
+            }
         }
     });
 }
 
-/// Reloads the Kayak window in place, from the server rather than a cache.
-fn reload_kayak(app: &AppHandle) {
-    let Some(window) = app.get_webview_window(KAYAK_WINDOW) else {
+/// Shows update progress in the launcher window.
+fn report_update(app: &AppHandle, state: &Launcher, message: &str, percent: i32) {
+    set_stage(
+        app,
+        state,
+        Stage::Updating {
+            message: message.to_string(),
+            percent,
+        },
+    );
+}
+
+/// The digest of the published Kayak, when it is not the one installed.
+///
+/// None with nothing installed -- the first start downloads it anyway, so that
+/// is not an update -- and when Docker Hub cannot be reached, which is normal
+/// offline and must not hold anything up. A release that would not start
+/// before is left alone when `respect_skipped` is set, so it is not downloaded
+/// and tried again by itself at every launch.
+fn newer_kayak(respect_skipped: bool) -> Option<String> {
+    let installed_server = docker::image_digest(&config::server_image())?;
+    let installed_sandbox = docker::image_digest(&config::sandbox_image());
+    let remote_server = match registry::latest_tag(config::SERVER_REPO, config::TAG) {
+        Ok(remote) => remote,
+        Err(error) => {
+            logs::record("update", &format!("could not reach Docker Hub: {error}"));
+            return None;
+        }
+    };
+    let remote_sandbox = registry::latest_tag(config::SANDBOX_REPO, config::TAG).ok();
+    let outdated = kayak_outdated(
+        &installed_server,
+        installed_sandbox.as_deref(),
+        &remote_server.digest,
+        remote_sandbox.as_ref().map(|remote| remote.digest.as_str()),
+    );
+    if !outdated {
+        return None;
+    }
+    if respect_skipped && images::is_skipped(&remote_server.digest) {
+        logs::record("update", "the published Kayak would not start before; leaving it alone");
+        return None;
+    }
+    Some(remote_server.digest)
+}
+
+/// Whether the installed images differ from the published ones.
+///
+/// Both are compared, not only the server: a download interrupted between the
+/// two leaves a new server beside an old sandbox, and comparing the server alone
+/// would call that up to date and never finish it. A side whose digest is not
+/// known says nothing either way.
+fn kayak_outdated(
+    installed_server: &str,
+    installed_sandbox: Option<&str>,
+    published_server: &str,
+    published_sandbox: Option<&str>,
+) -> bool {
+    let sandbox_differs = matches!(
+        (installed_sandbox, published_sandbox),
+        (Some(installed), Some(published)) if installed != published
+    );
+    installed_server != published_server || sandbox_differs
+}
+
+/// Downloads the published Kayak if it is newer than the installed one.
+fn refresh_kayak(app: &AppHandle, state: &Launcher) -> Result<(), String> {
+    if newer_kayak(true).is_none() {
+        return Ok(());
+    }
+    logs::record("update", "a newer Kayak is published; downloading it");
+    download_kayak(Some(app), state, &state.shutting_down)
+}
+
+/// Downloads the published Kayak images, keeping what they replace until Kayak
+/// has run from them.
+///
+/// Shows its progress in the launcher window when given `app`, and downloads
+/// silently otherwise.
+///
+/// What it replaces is recorded before anything is pulled, so a download cut
+/// short -- by a crash, say, between the two images -- still leaves a way back.
+/// A download that is stopped on purpose, through `cancel`, is left as it is:
+/// the next one picks up where it stopped, rather than downloading again what
+/// had already arrived. One that fails is undone, so the tags do not point at a
+/// mix of versions.
+fn download_kayak(app: Option<&AppHandle>, state: &Launcher, cancel: &AtomicBool) -> Result<(), String> {
+    let before = images::Previous::note();
+    let recorded_here = before.keep();
+    let images = [
+        (config::server_image(), 0, 50),
+        (config::sandbox_image(), 50, 100),
+    ];
+    let steps = images.len();
+    let downloaded = images.iter().enumerate().try_for_each(|(index, (image, from, to))| {
+        let label = format!("Downloading the update ({} of {steps})", index + 1);
+        if let Some(app) = app {
+            report_update(app, state, &label, *from);
+        }
+        docker::pull(image, cancel, |progress| {
+            if let Some(app) = app {
+                report_update(app, state, &label, progress_within(*from, *to, progress.done, progress.total));
+            }
+        })
+    });
+
+    if let Err(error) = downloaded {
+        if cancel.load(Ordering::SeqCst) {
+            return Err(error);
+        }
+        images::remove_images(&before.retag());
+        if recorded_here {
+            images::Previous::forget();
+        }
+        return Err(error);
+    }
+
+    drop_legacy_sandbox_tag();
+    record_image_identity(&config::server_image(), "downloaded");
+    if !before.moved() {
+        // Nothing new arrived, so there is nothing to go back from.
+        if recorded_here {
+            images::Previous::forget();
+        }
+        return Ok(());
+    }
+    // A release downloaded earlier and never run is replaced by this one, and
+    // nothing would ever use it again.
+    images::remove_superseded(&images::replaced_unkept(&before, images::Previous::kept().as_ref()));
+    Ok(())
+}
+
+/// Starts Kayak, and if newly downloaded images crash on starting, goes back to
+/// the ones they replaced.
+///
+/// Returns the port, and the reason the new version was given up on if it was.
+/// Kayak only proves a new version by starting it -- possibly at a launch long
+/// after it was downloaded in the background -- so this is where a broken
+/// release is undone. Only a crash counts: a server that is merely slow to
+/// answer may be a good release on a busy Mac, and is waited for, as any start
+/// is. The broken release is remembered, and deleted, only once the version
+/// before it has started; if that one will not start either, the new version is
+/// put back, and kept for another try.
+fn start_with_rollback(app: &AppHandle, state: &Launcher) -> Result<(u16, Option<String>), String> {
+    let error = match start_server(app, state) {
+        Ok(port) => {
+            images::confirm();
+            return Ok((port, None));
+        }
+        Err(error) => error,
+    };
+    let crashed = explain::classify(&error) == Problem::ServerExited;
+    // A kept version the tags still point at -- left by a download stopped
+    // before anything arrived -- is not an older one to go back to.
+    let Some(previous) = images::Previous::kept()
+        .filter(|previous| crashed && !stopping(state) && previous.moved())
+    else {
+        return Err(error);
+    };
+
+    logs::record(
+        "update",
+        &format!("the new version of Kayak would not start ({error}); going back to the one before"),
+    );
+    show_step(app, state, "Going back to the version you had", "This can take a minute.");
+    let newer = images::Previous::note();
+    let failed_digest = docker::image_digest(&config::server_image());
+    let downloaded = previous.retag();
+    // The new version's server is in the way of the name.
+    docker::stop_container(config::CONTAINER_NAME)?;
+    docker::remove_container(config::CONTAINER_NAME)?;
+
+    match start_server(app, state) {
+        Ok(port) => {
+            if let Some(digest) = failed_digest {
+                images::skip(&digest);
+            }
+            images::Previous::forget();
+            // Nothing uses them now that the previous version is serving.
+            images::remove_images(&downloaded);
+            Ok((port, Some(error)))
+        }
+        Err(previous_error) => {
+            logs::record(
+                "update",
+                &format!("the previous version would not start either: {previous_error}"),
+            );
+            newer.retag();
+            Err(error)
+        }
+    }
+}
+
+/// Whether the server running now is from an older image than the installed
+/// one -- a version downloaded in the background, waiting to be used.
+fn running_an_older_kayak() -> bool {
+    if docker::container_state(config::CONTAINER_NAME) != Ok(ContainerState::Running) {
+        return false;
+    }
+    let running = docker::container_image_id(config::CONTAINER_NAME);
+    let current = docker::image_id(&config::server_image());
+    !should_reuse(running.as_deref(), current.as_deref())
+}
+
+/// Brings everything up to date now, because the user asked, showing what it
+/// does in the launcher window.
+///
+/// Kayak first, then the app: installing the app restarts it, which would
+/// abandon a Kayak update halfway.
+fn check_for_updates_now(app: AppHandle, state: Arc<Launcher>) {
+    surface_launcher(&app);
+    // A start or an update already under way is waited for: it shows its own
+    // progress meanwhile, and the check follows it.
+    if state.busy.load(Ordering::SeqCst) && !state.prefetching.load(Ordering::SeqCst) {
+        note(&app, "Kayak will check for updates once it has finished what it is doing.");
+    }
+    let Some(_guard) = claim(&state, true) else {
         return;
     };
-    logs::record("window", "reloading Kayak");
-    match window.url() {
-        Ok(current) => {
-            let _ = window.navigate(refreshed(&current));
-        }
-        Err(_) => {
-            let _ = window.reload();
-        }
+    if stopping(&state) {
+        return;
     }
-}
 
-/// Brings back a page whose web content process ended.
-///
-/// WebKit runs each page in a process of its own, which macOS can end under
-/// memory pressure, leaving a blank window with nothing to click. The Kayak
-/// page is reloaded where it was, at a fresh address so the app shell comes
-/// from the running server rather than a cache.
-fn reload_after_crash(webview: &tauri::Webview) {
-    logs::record(
-        "window",
-        &format!("the {} page's content process ended; reloading it", webview.label()),
-    );
-    match webview.url() {
-        Ok(current) if webview.label() == KAYAK_WINDOW => {
-            let _ = webview.navigate(refreshed(&current));
-        }
-        _ => {
-            let _ = webview.reload();
-        }
+    lock(&state.update).checking = true;
+    let _ = app.emit("update", lock(&state.update).clone());
+    let app_update = find_app_update(&app, UPDATE_CHECK_TIMEOUT);
+    // What was found is downloaded even if it would not start before: the user
+    // asked for it, and is told if it fails again.
+    let download = newer_kayak(false).is_some();
+    let restart = download || running_an_older_kayak();
+    lock(&state.update).checking = false;
+    let _ = app.emit("update", lock(&state.update).clone());
+
+    if !restart && app_update.is_none() {
+        note(&app, "Kayak is up to date.");
+        return;
     }
-}
 
-/// Runs a JS snippet inside the Kayak window, if it is open.
-fn eval_in_kayak(app: &AppHandle, script: &str) {
-    if let Some(window) = app.get_webview_window(KAYAK_WINDOW) {
-        let _ = window.eval(script);
-    }
-}
-
-/// Encodes a value as a JS literal, so user-visible text cannot break the
-/// snippet it is interpolated into.
-fn js_literal<T: Serialize>(value: &T) -> String {
-    serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
-}
-
-fn show_banner_progress(app: &AppHandle, message: &str, percent: i32) {
-    eval_in_kayak(
-        app,
-        &format!(
-            "window.__kayakLauncher && window.__kayakLauncher.showProgress({}, {percent})",
-            js_literal(&message)
-        ),
-    );
-}
-
-/// Shows update progress wherever the user can see it: over Kayak when its
-/// window is up, otherwise in the launcher's own window. An update started from
-/// the launcher -- because Kayak could not start -- used to report its progress
-/// into a window that did not exist.
-fn report_update(app: &AppHandle, state: &Launcher, message: &str, percent: i32) {
-    if kayak_window_visible(app) {
-        show_banner_progress(app, message, percent);
-    } else {
-        set_stage(
-            app,
-            state,
-            Stage::Updating {
-                message: message.to_string(),
-                percent,
-            },
-        );
-    }
-}
-
-/// Builds the application menu, with both versions in the About panel.
-///
-/// Two separate things are installed on a user's machine and either can be out
-/// of date independently: this launcher, which updates through GitHub, and the
-/// Kayak server image, which updates through Docker Hub. The About panel showed
-/// only the launcher's version, which is the less interesting of the two --
-/// Kayak is what the user actually works in.
-///
-/// The menu is rebuilt rather than mutated because the Kayak version is not
-/// known at startup: it is read from the image label once the container is up.
-fn build_menu(app: &AppHandle, kayak_version: Option<&str>) -> tauri::Result<Menu<tauri::Wry>> {
-    let about = AboutMetadata {
-        version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        comments: Some(match kayak_version {
-            Some(version) => format!("Kayak {version}"),
-            None => "Kayak is not running yet".to_string(),
-        }),
-        ..Default::default()
-    };
-
-    let application = SubmenuBuilder::new(app, "Kayak")
-        .about(Some(about))
-        .separator()
-        .services()
-        .separator()
-        .hide()
-        .hide_others()
-        .show_all()
-        .separator()
-        .quit()
-        .build()?;
-
-    // Rebuilt explicitly because replacing the menu drops the defaults, and
-    // without these the Kayak window loses copy and paste entirely.
-    let edit = SubmenuBuilder::new(app, "Edit")
-        .undo()
-        .redo()
-        .separator()
-        .cut()
-        .copy()
-        .paste()
-        .select_all()
-        .build()?;
-
-    // A page that went blank or stuck had no way back short of quitting.
-    let reload = MenuItemBuilder::with_id(MENU_RELOAD, "Reload")
-        .accelerator("CmdOrCtrl+R")
-        .build(app)?;
-    let view = SubmenuBuilder::new(app, "View").item(&reload).build()?;
-
-    let window = SubmenuBuilder::new(app, "Window")
-        .minimize()
-        .separator()
-        .close_window()
-        .build()?;
-
-    // The log is the record of what went wrong; without this, finding it
-    // needed a terminal or knowing where macOS keeps logs.
-    let show_log = MenuItemBuilder::with_id(MENU_SHOW_LOG, "Show Kayak Log").build(app)?;
-    let help = SubmenuBuilder::new(app, "Help").item(&show_log).build()?;
-
-    MenuBuilder::new(app)
-        .items(&[&application, &edit, &view, &window, &help])
-        .build()
-}
-
-/// Puts the Kayak version into the About panel once it is known.
-fn refresh_menu(app: &AppHandle, kayak_version: Option<&str>) {
-    if let Ok(menu) = build_menu(app, kayak_version) {
-        let _ = app.set_menu(menu);
-    }
-}
-
-fn handle_menu(app: &AppHandle, id: &str) {
-    match id {
-        MENU_RELOAD => reload_kayak(app),
-        MENU_SHOW_LOG => {
-            let Some(path) = logs::launcher_log_path() else {
+    if restart {
+        if download {
+            if let Err(error) = download_kayak(Some(&app), &state, &state.shutting_down) {
+                logs::record("update", &format!("the update could not be downloaded: {error}"));
+                if !stopping(&state) {
+                    report_update_failure(&app, &state, explain::update_failure(&error));
+                }
                 return;
-            };
-            if let Err(error) = app.opener().reveal_item_in_dir(&path) {
-                logs::record("open", &format!("could not show the log: {error}"));
             }
         }
-        _ => {}
+        logs::record("update", "restarting Kayak on the new version");
+        // Replaced rather than reconnected to: the running server is the old
+        // version.
+        state.recreate_next.store(true, Ordering::SeqCst);
+        match start_with_rollback(&app, &state) {
+            Ok((port, rolled_back)) => {
+                *lock(&state.port) = Some(port);
+                let failed = rolled_back.is_some();
+                kayak_is_up(&app, &state, port, rolled_back.as_deref().map(Notice::update_failed));
+                {
+                    let (app, state) = (app.clone(), state.clone());
+                    thread::spawn(move || check_for_updates(app, state));
+                }
+                if failed {
+                    return;
+                }
+                if app_update.is_none() {
+                    note(&app, "Kayak is up to date.");
+                }
+            }
+            Err(error) => {
+                if !stopping(&state) {
+                    fail(&app, &state, &error);
+                }
+                return;
+            }
+        }
+    }
+
+    if let Some(update) = app_update {
+        let label = if restart {
+            "Finishing the update"
+        } else {
+            "Downloading the update"
+        };
+        if let Err(error) = install_app_update(&app, &state, &update, label, None) {
+            logs::record("update", &format!("the app could not be updated: {error}"));
+            if !stopping(&state) {
+                report_update_failure(&app, &state, explain::launcher_update_failure(&error).to_string());
+            }
+        }
     }
 }
 
-/// Draws whatever the user should currently be told, into the Kayak window.
-///
-/// Called both when something changes and when the page announces itself, so a
-/// banner survives a reload and no longer depends on the webview happening to
-/// have a document at the moment a check finished.
-///
-/// One banner regardless of what is pending. Two things can be out of date —
-/// the Kayak image and this launcher — but that is plumbing the user should
-/// not have to know about: showing two different banners with two different
-/// buttons meant updating twice in a row. The single button applies both.
-fn push_banner_state(app: &AppHandle, state: &Launcher) {
-    if let Some(notice) = lock(&state.notice).clone() {
-        eval_in_kayak(
-            app,
-            &format!(
-                "window.__kayakLauncher && window.__kayakLauncher.showError({})",
-                js_literal(&notice)
-            ),
-        );
-        return;
-    }
-
-    let update = lock(&state.update).clone();
-    let restarts = lock(&state.launcher_update).is_some();
-    if update.available || restarts {
-        eval_in_kayak(
-            app,
-            &format!(
-                "window.__kayakLauncher && window.__kayakLauncher.showUpdate({{date: {}, restarts: {}}})",
-                js_literal(&update.date),
-                restarts,
-            ),
-        );
-    }
-}
-
-/// Tells the user an update did not go through: over Kayak when it is on
-/// screen, otherwise on the launcher's failure screen.
-fn report_update_failure(app: &AppHandle, state: &Launcher, message: String, dismiss: &str) {
-    if kayak_window_visible(app) {
-        *lock(&state.notice) = Some(Notice {
-            title: explain::UPDATE_FAILED.to_string(),
-            message,
-            dismiss: dismiss.to_string(),
-        });
-        push_banner_state(app, state);
+/// Says that an update did not go through: on the Ready screen when Kayak is
+/// serving, and as a failure when it is not.
+fn report_update_failure(app: &AppHandle, state: &Launcher, message: String) {
+    let serving = lock(&state.port).is_some_and(kayak_answers);
+    let stage = if serving {
+        Stage::Ready {
+            notice: Some(Notice::new(explain::UPDATE_FAILED, message)),
+        }
     } else {
-        set_stage(
-            app,
-            state,
-            Stage::Failed {
-                headline: explain::UPDATE_FAILED.to_string(),
-                body: message,
-            },
-        );
-        surface_launcher(app);
-    }
+        Stage::Failed {
+            headline: explain::UPDATE_FAILED.to_string(),
+            body: message,
+        }
+    };
+    set_stage(app, state, stage);
+    surface_launcher(app);
 }
 
 /// The updater for this app, configured for this Mac.
@@ -1354,8 +1403,8 @@ fn report_update_failure(app: &AppHandle, state: &Launcher, message: String, dis
 /// and offered it even at the same version: it cannot use the graphics chip,
 /// and its users have no other way of finding out they downloaded the wrong
 /// one. Once installed, the new build runs natively and this no longer applies.
-fn launcher_updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, String> {
-    let mut builder = app.updater_builder().timeout(UPDATE_CHECK_TIMEOUT);
+fn launcher_updater(app: &AppHandle, timeout: Duration) -> Result<tauri_plugin_updater::Updater, String> {
+    let mut builder = app.updater_builder().timeout(timeout);
     if metal::silicon() == metal::Silicon::Translated {
         builder = builder
             .target("darwin-aarch64")
@@ -1364,116 +1413,195 @@ fn launcher_updater(app: &AppHandle) -> Result<tauri_plugin_updater::Updater, St
     builder.build().map_err(|error| error.to_string())
 }
 
-/// Asks GitHub whether a newer launcher has been published.
-///
-/// Runs in Rust rather than the launcher window's page because that window is
-/// hidden once Kayak opens, so an update found there would never be seen.
-fn check_launcher_update(app: AppHandle, state: Arc<Launcher>) {
-    let updater = match launcher_updater(&app) {
+/// Asks GitHub whether a newer app has been published. None when there is no
+/// newer one, and when GitHub cannot be reached, which is normal offline.
+fn find_app_update(app: &AppHandle, timeout: Duration) -> Option<tauri_plugin_updater::Update> {
+    let updater = match launcher_updater(app, timeout) {
         Ok(updater) => updater,
         Err(error) => {
             logs::record("update", &format!("could not set up the app updater: {error}"));
-            return;
+            return None;
         }
     };
-    let found = match tauri::async_runtime::block_on(updater.check()) {
-        Ok(found) => found,
-        // Offline, or no release published yet. Neither is worth showing.
+    match tauri::async_runtime::block_on(updater.check()) {
+        Ok(found) => {
+            if let Some(update) = &found {
+                logs::record("update", &format!("app version {} is available", update.version));
+            }
+            found
+        }
         Err(error) => {
             logs::record("update", &format!("could not check for a new app: {error}"));
+            None
+        }
+    }
+}
+
+/// Installs a newer app, if there is one, before Kayak is started.
+///
+/// A failure is logged and the launch carries on: the app already installed
+/// still runs Kayak. So does a download that is merely slow -- it is given up
+/// after [`LAUNCH_APP_UPDATE_LIMIT`] and tried again at the next launch.
+fn update_app_at_launch(app: &AppHandle, state: &Arc<Launcher>) {
+    let Some(update) = find_app_update(app, LAUNCH_UPDATE_CHECK_TIMEOUT) else {
+        return;
+    };
+    let attempted = std::fs::read_to_string(paths::beside_data(LAUNCHER_ATTEMPT_FILE)).ok();
+    if !retry_launcher_update(attempted.as_deref(), &update.version) {
+        logs::record(
+            "update",
+            "that app update was installed before and did not take; leaving it to Check for Updates",
+        );
+        return;
+    }
+    let installed = install_app_update(
+        app,
+        state,
+        &update,
+        "Downloading the update",
+        Some(LAUNCH_APP_UPDATE_LIMIT),
+    );
+    if let Err(error) = installed {
+        logs::record("update", &format!("the app could not be updated: {error}"));
+    }
+}
+
+/// Whether to install `offered` by itself at launch, given the version last
+/// installed that way.
+///
+/// An update installed before and offered again did not take -- a release whose
+/// manifest names a version its download does not contain, or the Apple-chip
+/// build offered at the same version to an Intel build it did not replace.
+/// Installing it again at every launch would restart the app forever.
+fn retry_launcher_update(attempted: Option<&str>, offered: &str) -> bool {
+    attempted.map(str::trim) != Some(offered)
+}
+
+/// Downloads and installs an app update, then restarts into it. Returns only if
+/// it failed -- or, given a `limit`, took longer than that.
+fn install_app_update(
+    app: &AppHandle,
+    state: &Arc<Launcher>,
+    update: &tauri_plugin_updater::Update,
+    label: &str,
+    limit: Option<Duration>,
+) -> Result<(), String> {
+    surface_launcher(app);
+    report_update(app, state, label, -1);
+    download_launcher_update(app, state, update, label, limit)?;
+
+    logs::record("update", "the new app is installed; restarting");
+    // Written before restarting, or the guard against restarting forever is
+    // not there when it is needed.
+    if let Err(error) = paths::write_beside_data(LAUNCHER_ATTEMPT_FILE, update.version.as_bytes()) {
+        logs::record("update", &format!("could not note the update: {error}"));
+    }
+    remember_open_tab(state);
+    report_update(app, state, "Restarting Kayak…", 100);
+    // Everything this process started is stopped first: the restart replaces
+    // the process, an orphaned container would refuse the name on the way back
+    // up, and an orphaned GPU server would keep its model in memory with
+    // nothing left to stop it.
+    stop_everything(state);
+    app.restart();
+}
+
+/// Notes the open Kayak tab before restarting into an app update, so the
+/// restarted app leaves that tab to reconnect rather than opening a second one.
+fn remember_open_tab(state: &Launcher) {
+    if let Some(tab) = lock(&state.opened_tab).as_ref() {
+        let _ = paths::write_beside_data(OPEN_TAB_FILE, encode_open_tab(tab).as_bytes());
+    }
+}
+
+/// The tab left open by the app this one restarted from, if it restarted just
+/// now.
+fn recall_open_tab() -> Option<OpenTab> {
+    let path = paths::beside_data(OPEN_TAB_FILE);
+    let written = std::fs::metadata(&path).and_then(|metadata| metadata.modified()).ok();
+    let body = std::fs::read_to_string(&path).ok();
+    let _ = std::fs::remove_file(&path);
+    let age = written.and_then(|written| written.elapsed().ok())?;
+    decode_open_tab(&body?, age)
+}
+
+fn encode_open_tab(tab: &OpenTab) -> String {
+    format!("{}\n{}", tab.port, tab.signed_in_as.as_deref().unwrap_or_default())
+}
+
+/// Reads a remembered tab, ignoring one too old to be from the restart just
+/// made: a tab from some earlier run is long gone.
+fn decode_open_tab(written: &str, age: Duration) -> Option<OpenTab> {
+    if age > Duration::from_secs(10 * 60) {
+        return None;
+    }
+    let mut lines = written.lines();
+    let port = lines.next()?.trim().parse().ok().filter(|port| *port != 0)?;
+    let signed_in_as = lines
+        .next()
+        .map(str::trim)
+        .filter(|fingerprint| !fingerprint.is_empty())
+        .map(str::to_string);
+    Some(OpenTab { port, signed_in_as })
+}
+
+/// Downloads a newer Kayak in the background, so the next launch starts it
+/// straight away.
+///
+/// Leaves the running Kayak alone: pulling only moves the tags, and the server
+/// keeps running from the image it started from until the next start replaces
+/// it. Gives way to anything the user asks for in the meantime.
+fn prefetch_kayak(state: &Arc<Launcher>) {
+    if newer_kayak(true).is_none() {
+        return;
+    }
+    // Announced before the busy flag is taken, so that [`claim`] never takes a
+    // background download for a start and gives up on what the user asked for.
+    state.prefetching.store(true, Ordering::SeqCst);
+    let Some(_guard) = BusyGuard::acquire(state) else {
+        state.prefetching.store(false, Ordering::SeqCst);
+        return;
+    };
+    state.prefetch_cancel.store(false, Ordering::SeqCst);
+    // Checked after lowering the flag, so a quit that raised it a moment ago
+    // is not missed.
+    if stopping(state) {
+        state.prefetching.store(false, Ordering::SeqCst);
+        return;
+    }
+    logs::record("update", "downloading the newer Kayak in the background, for the next launch");
+    let downloaded = download_kayak(None, state, &state.prefetch_cancel);
+    state.prefetching.store(false, Ordering::SeqCst);
+    match downloaded {
+        Ok(()) => logs::record("update", "the newer Kayak is ready for the next launch"),
+        Err(error) => logs::record("update", &format!("the background download stopped: {error}")),
+    }
+}
+
+/// Checks on a long interval, for the life of the app, and downloads a newer
+/// Kayak ahead of the next launch. The app's own update is left for launch,
+/// where restarting interrupts nothing.
+fn spawn_update_watcher(app: AppHandle, state: Arc<Launcher>) {
+    thread::spawn(move || loop {
+        thread::sleep(UPDATE_INTERVAL);
+        if stopping(&state) {
             return;
         }
-    };
-    let Some(update) = found else {
-        return;
-    };
-
-    let version = update.version.clone();
-    logs::record("update", &format!("app version {version} is available"));
-    *lock(&state.launcher_update) = Some(update);
-    let _ = app.emit("launcher-update", version);
-    push_banner_state(&app, &state);
-}
-
-/// Applies everything that is pending: the Kayak images first, then the
-/// launcher itself.
-///
-/// This order is the only one that works unattended. Installing the launcher
-/// restarts the app, so doing it first would abandon a Kayak update halfway
-/// and greet the user with a second banner after the restart — the exact
-/// two-step experience the single banner exists to avoid.
-fn apply_updates(app: AppHandle, state: Arc<Launcher>) {
-    let Some(_guard) = BusyGuard::acquire(&state) else {
-        return;
-    };
-    if stopping(&state) {
-        return;
-    }
-    lock(&state.notice).take();
-
-    let kayak_pending = lock(&state.update).available;
-    if kayak_pending && !update_kayak_image(&app, &state) {
-        // The failure has its own message and retry; restarting the launcher
-        // on top of it would wipe the explanation away.
-        return;
-    }
-    apply_launcher_update(&app, &state, kayak_pending);
-}
-
-/// Downloads and installs the launcher update, then restarts into it.
-/// Does nothing when no launcher update is pending.
-///
-/// The pending update is cloned rather than taken: taking it meant a failed
-/// download lost it, and Try again then had nothing left to install.
-fn apply_launcher_update(app: &AppHandle, state: &Arc<Launcher>, after_kayak: bool) {
-    let Some(update) = lock(&state.launcher_update).clone() else {
-        return;
-    };
-    if stopping(state) {
-        return;
-    }
-
-    let label = if after_kayak {
-        "Finishing the update"
-    } else {
-        "Downloading the update"
-    };
-    report_update(app, state, label, -1);
-    match download_launcher_update(app, state, &update, label) {
-        Ok(()) => {
-            lock(&state.launcher_update).take();
-            logs::record("update", "the new app is installed; restarting");
-            report_update(app, state, "Restarting Kayak…", 100);
-            // Everything this process started is stopped first: the restart
-            // replaces the process, an orphaned container would refuse the
-            // name on the way back up, and an orphaned GPU server would keep
-            // its model in memory with nothing left to stop it.
-            stop_everything(state);
-            app.restart();
-        }
-        Err(error) => {
-            logs::record("update", &format!("the app could not be updated: {error}"));
-            if stopping(state) {
-                return;
-            }
-            report_update_failure(
-                app,
-                state,
-                explain::launcher_update_failure(&error).to_string(),
-                "Not now",
-            );
-        }
-    }
+        check_for_updates(app.clone(), state.clone());
+        prefetch_kayak(&state);
+    });
 }
 
 /// Downloads and installs the app's update, abandoning it if the download
-/// stalls or the app begins quitting.
+/// stalls, runs past `limit`, or the app begins quitting.
 fn download_launcher_update(
     app: &AppHandle,
     state: &Launcher,
     update: &tauri_plugin_updater::Update,
     label: &str,
+    limit: Option<Duration>,
 ) -> Result<(), String> {
+    let began = Instant::now();
     // When a chunk last arrived, how much has arrived, and the expected size.
     let received = Arc::new(Mutex::new((Instant::now(), 0u64, None::<u64>)));
     let task = {
@@ -1507,6 +1635,10 @@ fn download_launcher_update(
                 LAUNCHER_DOWNLOAD_STALL.as_secs()
             ));
         }
+        if limit.is_some_and(|limit| began.elapsed() >= limit) {
+            task.abort();
+            return Err("the download was too slow to wait for".to_string());
+        }
         let percent = total
             .filter(|total| *total > 0)
             .map(|total| (bytes.saturating_mul(100) / total).min(100) as i32)
@@ -1524,20 +1656,21 @@ fn download_launcher_update(
 
 /// Stops everything the launcher started, then quits.
 ///
-/// Run on its own thread with the window still up: `docker stop` gives the
-/// server time to close its database, and doing that on the main thread froze
-/// the window for the duration, which reads as a crash rather than a shutdown.
+/// Run on its own thread with the launcher window showing what is happening:
+/// `docker stop` gives the server time to close its database, and Kayak's tab
+/// in the browser cannot say that it is stopping.
 ///
 /// A start or an update under way is given a moment to notice and stop between
 /// steps, so the shutdown does not stop a container that the start then
-/// recreates. And whatever happens, the app exits within [`SHUTDOWN_LIMIT`].
+/// recreates. And whatever happens, the app exits within [`QUIT_DEADLINE`].
 fn begin_shutdown(app: AppHandle, state: Arc<Launcher>) {
     if state.shutting_down.swap(true, Ordering::SeqCst) {
         return;
     }
+    state.prefetch_cancel.store(true, Ordering::SeqCst);
     logs::record("shutdown", "quitting");
-    eval_in_kayak(&app, "window.__kayakLauncher && window.__kayakLauncher.showShutdown()");
     set_stage(&app, &state, Stage::Stopping);
+    surface_launcher(&app);
 
     {
         let app = app.clone();
@@ -1582,6 +1715,7 @@ fn wait_while_busy(state: &Launcher, deadline: Instant) {
 /// at once.
 fn stop_everything(state: &Launcher) {
     state.shutting_down.store(true, Ordering::SeqCst);
+    state.prefetch_cancel.store(true, Ordering::SeqCst);
     if state.stopped.swap(true, Ordering::SeqCst) {
         return;
     }
@@ -1628,62 +1762,120 @@ fn stop_metal_server(state: &Launcher) {
     *running = None;
 }
 
-/// Schemes the launcher is willing to hand to the operating system.
+/// Closing the launcher window puts it away while Kayak is in use, and quits
+/// otherwise.
 ///
-/// An allow-list rather than a block-list. The page asking for this is served
-/// from the container, where an agent can influence what ends up on it, so a
-/// `file:` or a shell-adjacent scheme arriving here must not be honoured.
-const OPENABLE_SCHEMES: [&str; 3] = ["http", "https", "mailto"];
-
-/// Opens a URL in whatever the operating system uses for it.
-fn open_externally(app: &AppHandle, target: &str) {
-    let scheme = target
-        .split_once(':')
-        .map(|(scheme, _)| scheme.to_ascii_lowercase())
-        .unwrap_or_default();
-
-    if !OPENABLE_SCHEMES.contains(&scheme.as_str()) {
-        logs::record("open", &format!("refused to open a {scheme} url"));
+/// Once Kayak is open in the browser, the tab depends on it, so closing this
+/// window must not stop it: Quit is what stops Kayak. Before that -- setting up,
+/// or a failure before Kayak ever opened -- the window is the app, and closing
+/// it quits as it always has.
+fn watch_launcher_window(app: &AppHandle) {
+    let Some(window) = app.get_webview_window(LAUNCHER_WINDOW) else {
         return;
-    }
+    };
+    let handle = app.clone();
+    window.on_window_event(move |event| {
+        if let WindowEvent::CloseRequested { api, .. } = event {
+            let Some(state) = handle.try_state::<Arc<Launcher>>() else {
+                return;
+            };
+            api.prevent_close();
+            if stopping(&state) {
+                // Left up to say that Kayak is stopping.
+                return;
+            }
+            let in_use = lock(&state.opened_tab).is_some()
+                || matches!(*lock(&state.stage), Stage::Ready { .. });
+            if in_use {
+                hide_launcher(&handle);
+            } else {
+                begin_shutdown(handle.clone(), state.inner().clone());
+            }
+        }
+    });
+}
 
-    logs::record("open", &format!("opening {scheme} link externally"));
-    if let Err(error) = app.opener().open_url(target, None::<&str>) {
-        logs::record("open", &format!("could not open the link: {error}"));
+/// Builds the application menu, with both versions in the About panel.
+///
+/// Two separate things are installed on a user's machine and either can be out
+/// of date independently: this launcher, which updates through GitHub, and the
+/// Kayak server image, which updates through Docker Hub. The About panel showed
+/// only the launcher's version, which is the less interesting of the two --
+/// Kayak is what the user actually works in.
+///
+/// The menu is rebuilt rather than mutated because the Kayak version is not
+/// known at startup: it is read from the image label once the container is up.
+fn build_menu(app: &AppHandle, kayak_version: Option<&str>) -> tauri::Result<Menu<tauri::Wry>> {
+    let about = AboutMetadata {
+        version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        comments: Some(match kayak_version {
+            Some(version) => format!("Kayak {version}"),
+            None => "Kayak is not running yet".to_string(),
+        }),
+        ..Default::default()
+    };
+
+    // A way back to Kayak once its tab is closed, besides the Dock icon.
+    let open = MenuItemBuilder::with_id(MENU_OPEN, "Open Kayak")
+        .accelerator("CmdOrCtrl+O")
+        .build(app)?;
+    let check = MenuItemBuilder::with_id(MENU_CHECK_UPDATES, "Check for Updates…").build(app)?;
+
+    let application = SubmenuBuilder::new(app, "Kayak")
+        .about(Some(about))
+        .separator()
+        .item(&open)
+        .item(&check)
+        .separator()
+        .services()
+        .separator()
+        .hide()
+        .hide_others()
+        .show_all()
+        .separator()
+        .quit_with_text("Quit Kayak")
+        .build()?;
+
+    let window = SubmenuBuilder::new(app, "Window")
+        .minimize()
+        .separator()
+        .close_window()
+        .build()?;
+
+    // The log is the record of what went wrong; without this, finding it
+    // needed a terminal or knowing where macOS keeps logs.
+    let show_log = MenuItemBuilder::with_id(MENU_SHOW_LOG, "Show Kayak Log").build(app)?;
+    let help = SubmenuBuilder::new(app, "Help").item(&show_log).build()?;
+
+    MenuBuilder::new(app)
+        .items(&[&application, &window, &help])
+        .build()
+}
+
+/// Puts the Kayak version into the About panel once it is known.
+fn refresh_menu(app: &AppHandle, kayak_version: Option<&str>) {
+    if let Ok(menu) = build_menu(app, kayak_version) {
+        let _ = app.set_menu(menu);
     }
 }
 
-/// Responds to a button press in the injected banner.
-fn handle_banner_action(
-    app: &AppHandle,
-    action: String,
-    query: std::collections::HashMap<String, String>,
-) {
+fn handle_menu(app: &AppHandle, id: &str) {
     let Some(state) = app.try_state::<Arc<Launcher>>() else {
         return;
     };
     let state = state.inner().clone();
-
-    match action.as_str() {
-        // The page has a document and can be drawn on. Anything found before
-        // this point was pushed into a webview that could not receive it.
-        "ready" => push_banner_state(app, &state),
-        // "self-update" survives as an alias so a banner injected by an older
-        // launcher build still lands somewhere sensible.
-        "update" | "self-update" => {
+    match id {
+        MENU_OPEN => open_kayak_now(app.clone(), state),
+        MENU_CHECK_UPDATES => {
             let app = app.clone();
-            thread::spawn(move || apply_updates(app, state));
+            thread::spawn(move || check_for_updates_now(app, state));
         }
-        "dismiss" => {
-            lock(&state.notice).take();
-            lock(&state.update).available = false;
-            // The one banner covers both updates, so Later must silence both.
-            // The next scheduled check finds the launcher update again.
-            lock(&state.launcher_update).take();
-        }
-        "open" => {
-            if let Some(target) = query.get("url") {
-                open_externally(app, target);
+        MENU_SHOW_LOG => {
+            let Some(path) = logs::launcher_log_path() else {
+                return;
+            };
+            if let Err(error) = app.opener().reveal_item_in_dir(&path) {
+                logs::record("open", &format!("could not show the log: {error}"));
             }
         }
         _ => {}
@@ -1720,35 +1912,18 @@ fn check_for_updates(app: AppHandle, state: Arc<Launcher>) {
         ),
     }
 
-    let info = match result {
-        Err(error) => UpdateInfo {
-            available: false,
-            checking: false,
-            date: None,
-            installed: display,
-            published: None,
-            // Reported but not surfaced as a failure: being offline is normal
-            // and must not look like something is broken.
-            error: Some(error),
-        },
-        Ok(remote) => {
-            // With nothing installed there is nothing to compare, and the boot
-            // sequence will pull it anyway, so this is not an "update".
-            let available = installed
-                .as_ref()
-                .is_some_and(|local| local != &remote.digest);
-            UpdateInfo {
-                available,
-                checking: false,
-                date: remote
-                    .published
-                    .as_deref()
-                    .and_then(registry::friendly_date),
-                installed: display,
-                published: Some(registry::short_digest(&remote.digest)),
-                error: None,
-            }
-        }
+    // Being offline is normal and must not look like something is broken, so
+    // an unreachable Docker Hub only means nothing is known to be newer. With
+    // nothing installed there is nothing to compare either: the first start
+    // downloads Kayak anyway, so that is not an "update".
+    let available = match (&result, &installed) {
+        (Ok(remote), Some(local)) => local != &remote.digest,
+        _ => false,
+    };
+    let info = UpdateInfo {
+        available,
+        checking: false,
+        installed: display,
     };
 
     // Read from the result rather than from the stored state, which still holds
@@ -1756,248 +1931,6 @@ fn check_for_updates(app: AppHandle, state: Arc<Launcher>) {
     refresh_menu(&app, info.installed.as_deref());
 
     set_update(&app, &state, info);
-    push_banner_state(&app, &state);
-}
-
-/// Checks when the launcher opens and then on a long interval, for the life of
-/// the app.
-///
-/// Started with the launcher rather than once Kayak is serving: a release that
-/// stops Kayak from starting at all could otherwise never be replaced by the
-/// one that fixes it. The app's own update in particular needs no Docker.
-fn spawn_update_watcher(app: AppHandle, state: Arc<Launcher>) {
-    thread::spawn(move || loop {
-        check_for_updates(app.clone(), state.clone());
-        // Checked on the same schedule so a launcher released while the app is
-        // open is offered too, rather than only at the next cold start.
-        check_launcher_update(app.clone(), state.clone());
-        thread::sleep(UPDATE_INTERVAL);
-    });
-}
-
-/// The images Kayak ran from before an update, so a failed update can be undone.
-struct Previous(Vec<(String, Option<String>)>);
-
-impl Previous {
-    /// Noted before the pull: repointing a tag leaves the image it replaced
-    /// behind, untagged and several gigabytes large, and after the pull there is
-    /// no way to tell which of the untagged images used to be ours.
-    fn note() -> Self {
-        Self(
-            [config::server_image(), config::sandbox_image()]
-                .into_iter()
-                .map(|tag| {
-                    let id = docker::image_id(&tag);
-                    (tag, id)
-                })
-                .collect(),
-        )
-    }
-
-    fn ids(&self) -> Vec<String> {
-        self.0.iter().filter_map(|(_, id)| id.clone()).collect()
-    }
-
-    /// Points each tag back at the image it named before the update, and
-    /// returns the images the update had downloaded in their place.
-    ///
-    /// Without this, a failed update was undone only until the next launch,
-    /// which started the very version that had just failed. The downloaded
-    /// images are only returned, not deleted: the failed server may still be
-    /// using one, and Docker refuses to delete an image a container uses.
-    fn retag(&self) -> Vec<String> {
-        let mut downloaded = Vec::new();
-        for (tag, previous) in &self.0 {
-            let Some(previous) = previous else {
-                continue;
-            };
-            let now = docker::image_id(tag);
-            if now.as_deref() == Some(previous.as_str()) {
-                continue;
-            }
-            match docker::tag(previous, tag) {
-                Ok(()) => {
-                    logs::record("update", &format!("{tag} points at the previous version again"));
-                    downloaded.extend(now);
-                }
-                Err(error) => logs::record("update", &format!("could not restore {tag}: {error}")),
-            }
-        }
-        downloaded
-    }
-}
-
-/// Deletes images by ID. Failures are ignored: an image something still uses
-/// is one that should stay.
-fn remove_images(ids: &[String]) {
-    for id in ids {
-        let _ = docker::remove_image(id);
-    }
-}
-
-/// Deletes images that have been replaced.
-///
-/// Only once the new server is running: Docker refuses to remove an image a
-/// container still references, so doing this any earlier would fail on the
-/// very image being replaced.
-fn remove_superseded(ids: &[String]) {
-    if ids.is_empty() {
-        return;
-    }
-    let current: Option<Vec<String>> = [config::server_image(), config::sandbox_image()]
-        .iter()
-        .map(|image| docker::image_id(image))
-        .collect();
-    remove_images(&no_longer_used(ids, current));
-}
-
-/// The images among `ids` that no tag points at any more.
-///
-/// When the current images could not all be read, nothing is: a lookup that
-/// failed for a moment would otherwise leave the image in use off the list of
-/// current ones, and delete it from under Kayak.
-fn no_longer_used(ids: &[String], current: Option<Vec<String>>) -> Vec<String> {
-    let Some(current) = current else {
-        logs::record("update", "could not read the current images; keeping the old ones");
-        return Vec::new();
-    };
-    ids.iter().filter(|id| !current.contains(id)).cloned().collect()
-}
-
-/// Pulls the new images and replaces the running container with them.
-///
-/// Reports success so the combined flow knows whether to carry on to the
-/// launcher update. The caller holds the busy guard.
-///
-/// The previous version is only discarded once the new one has proved itself.
-/// A failure at any step puts the previous version back -- tags, images and,
-/// if it had already been stopped, the running server -- so "Not now" never
-/// leaves Kayak dead behind it.
-fn update_kayak_image(app: &AppHandle, state: &Arc<Launcher>) -> bool {
-    logs::record("update", "applying a Kayak update");
-    let previous = Previous::note();
-    // Whether the running server has been taken down, after which a failure
-    // has to start the previous version again rather than leave it running.
-    let mut replaced = false;
-
-    let result = (|| -> Result<u16, String> {
-        pull_update(app, state)?;
-        ensure_not_stopping(state)?;
-
-        report_update(app, state, "Restarting Kayak", 80);
-        let data_dir = paths::ensure_data_dir()?;
-
-        replaced = true;
-        // Stopped gracefully rather than killed: the server owns a SQLite
-        // database, and a SIGKILL mid-write can leave it corrupt.
-        docker::stop_container(config::CONTAINER_NAME)?;
-        docker::remove_container(config::CONTAINER_NAME)?;
-
-        let port = launch_container(app, &config::server_image(), &data_dir, state)?;
-        report_update(app, state, "Waiting for Kayak to come back", 92);
-        wait_for_health(port, Duration::from_secs(config::HEALTH_TIMEOUT_SECS), state)?;
-        Ok(port)
-    })();
-
-    match result {
-        Ok(port) => {
-            remove_superseded(&previous.ids());
-            *lock(&state.port) = Some(port);
-            lock(&state.update).available = false;
-            // The port can change across a restart, so the window is pointed
-            // at the new address rather than simply reloaded, and cache-busted:
-            // a plain navigation is served from the webview's HTTP cache, which
-            // is exactly how an update used to bring back the previous
-            // release's UI instead of the one just installed.
-            present_kayak(app, state, port);
-            // Read again so the About panel, the banner and the versions Kayak
-            // shows describe what is now installed rather than what was.
-            let (app, state) = (app.clone(), state.clone());
-            thread::spawn(move || check_for_updates(app, state));
-            true
-        }
-        Err(error) => {
-            logs::record("update", &format!("update failed: {error}"));
-            let downloaded = previous.retag();
-            if stopping(state) {
-                // Quitting removes the failed server; an image it was using
-                // is refused here and left for the next update to replace.
-                remove_images(&downloaded);
-            } else {
-                recover_from_failed_update(app, state, replaced, &downloaded, &error);
-            }
-            false
-        }
-    }
-}
-
-/// Puts Kayak back on screen after a failed update, on the version the user had,
-/// deletes what the update downloaded, and says what happened.
-fn recover_from_failed_update(
-    app: &AppHandle,
-    state: &Arc<Launcher>,
-    replaced: bool,
-    downloaded: &[String],
-    error: &str,
-) {
-    if !replaced {
-        // The previous server was never touched, so nothing uses the
-        // downloaded images and they can go straight away.
-        remove_images(downloaded);
-    } else {
-        report_update(app, state, "Going back to the version you had", 95);
-        let restarted = (|| -> Result<u16, String> {
-            let data_dir = paths::ensure_data_dir()?;
-            // Whatever the update started is in the way of the name.
-            docker::stop_container(config::CONTAINER_NAME)?;
-            docker::remove_container(config::CONTAINER_NAME)?;
-            // Only now that the failed server is gone can Docker delete the
-            // images it was started from.
-            remove_images(downloaded);
-            let port = launch_container(app, &config::server_image(), &data_dir, state)?;
-            wait_for_health(port, Duration::from_secs(config::HEALTH_TIMEOUT_SECS), state)?;
-            Ok(port)
-        })();
-        match restarted {
-            Ok(port) => {
-                logs::record("update", "the previous version is running again");
-                *lock(&state.port) = Some(port);
-                if !present_kayak(app, state, port) {
-                    return;
-                }
-            }
-            Err(restart_error) => {
-                logs::record(
-                    "update",
-                    &format!("the previous version could not be started again: {restart_error}"),
-                );
-                if !stopping(state) {
-                    fail(app, state, &restart_error);
-                }
-                return;
-            }
-        }
-    }
-    report_update_failure(app, state, explain::update_failure(error), "OK");
-}
-
-/// Downloads both images for an update, as one progress bar.
-fn pull_update(app: &AppHandle, state: &Launcher) -> Result<(), String> {
-    let images = [
-        (config::server_image(), 0, 50),
-        (config::sandbox_image(), 50, 75),
-    ];
-    let steps = images.len();
-    for (index, (image, from, to)) in images.iter().enumerate() {
-        let label = format!("Downloading the update ({} of {steps})", index + 1);
-        report_update(app, state, &label, *from);
-        docker::pull(image, &state.shutting_down, |progress| {
-            report_update(app, state, &label, progress_within(*from, *to, progress.done, progress.total));
-        })?;
-    }
-
-    drop_legacy_sandbox_tag();
-    Ok(())
 }
 
 /// Maps one download's progress onto its share of the update's progress bar.
@@ -2048,16 +1981,17 @@ fn assess_outage(daemon: Daemon, container: Option<ContainerState>, misses: u32)
 /// Watches a running Kayak, for the life of the app.
 ///
 /// Without it, a server that stopped -- or a Docker Desktop that was quit --
-/// left the Kayak window on a dead page with no explanation and no way back
-/// short of quitting. Quiet whenever Kayak is not meant to be running, or a
-/// start or an update is replacing it on purpose.
+/// left Kayak's tab on a dead page with no explanation and no way back short of
+/// quitting. Quiet whenever Kayak is not meant to be running, or a start or an
+/// update is replacing it on purpose; a background download is neither.
 fn spawn_health_watch(app: AppHandle, state: Arc<Launcher>) {
     thread::spawn(move || {
         let mut misses = 0;
         while !stopping(&state) {
             thread::sleep(WATCH_INTERVAL);
-            let watching =
-                !state.busy.load(Ordering::SeqCst) && matches!(*lock(&state.stage), Stage::Ready);
+            let replacing =
+                state.busy.load(Ordering::SeqCst) && !state.prefetching.load(Ordering::SeqCst);
+            let watching = !replacing && matches!(*lock(&state.stage), Stage::Ready { .. });
             let port = *lock(&state.port);
             let (true, Some(port)) = (watching, port) else {
                 misses = 0;
@@ -2088,7 +2022,9 @@ fn spawn_health_watch(app: AppHandle, state: Arc<Launcher>) {
 }
 
 fn respond_to_outage(app: &AppHandle, state: &Arc<Launcher>, outage: Outage) {
-    let Some(guard) = BusyGuard::acquire(state) else {
+    // Not waited for: a start or an update under way is replacing Kayak on
+    // purpose, and will notice anything wrong itself.
+    let Some(guard) = claim(state, false) else {
         return;
     };
     if stopping(state) {
@@ -2575,30 +2511,16 @@ fn open_docker() {
     });
 }
 
-/// Shows the Kayak window, for when the launcher window is the one in focus.
+/// Opens Kayak in the browser, from the launcher window's Ready screen.
 #[tauri::command]
-fn open_kayak(app: AppHandle, state: tauri::State<'_, Arc<Launcher>>) -> Result<(), String> {
-    let port = lock(&state.port).ok_or_else(|| "Kayak is not running yet".to_string())?;
-    // No sign-in here: the window was signed in when Kayak was first shown, and
-    // its session holds the key itself, so it outlasts a replaced server too.
-    show_kayak(&app, &format!("http://127.0.0.1:{port}"), None)?;
-    if let Some(window) = app.get_webview_window(LAUNCHER_WINDOW) {
-        let _ = window.hide();
-    }
-    Ok(())
+fn open_kayak(app: AppHandle, state: tauri::State<'_, Arc<Launcher>>) {
+    open_kayak_now(app, state.inner().clone());
 }
 
+/// Quits, stopping Kayak and everything it started.
 #[tauri::command]
-fn check_updates(app: AppHandle, state: tauri::State<'_, Arc<Launcher>>) {
-    let state = state.inner().clone();
-    thread::spawn(move || check_for_updates(app, state));
-}
-
-/// Applies whatever is pending — Kayak images, launcher, or both.
-#[tauri::command]
-fn install_update(app: AppHandle, state: tauri::State<'_, Arc<Launcher>>) {
-    let state = state.inner().clone();
-    thread::spawn(move || apply_updates(app, state));
+fn quit(app: AppHandle, state: tauri::State<'_, Arc<Launcher>>) {
+    begin_shutdown(app, state.inner().clone());
 }
 
 /// Puts what went wrong, and what the launcher was doing, on the clipboard,
@@ -2617,9 +2539,7 @@ fn copy_details(state: tauri::State<'_, Arc<Launcher>>) -> Result<(), String> {
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
-        .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_opener::init())
-        .plugin(tauri_plugin_process::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .manage(Arc::new(Launcher::new()))
         .invoke_handler(tauri::generate_handler![
@@ -2627,12 +2547,10 @@ pub fn run() {
             start,
             open_docker,
             open_kayak,
-            check_updates,
-            install_update,
+            quit,
             copy_details,
         ])
         .on_menu_event(|app, event| handle_menu(app, event.id().as_ref()))
-        .on_web_content_process_terminate(reload_after_crash)
         .setup(|app| {
             // First, so that a launch which fails before Kayak ever runs still
             // leaves a record somewhere the user can find.
@@ -2648,6 +2566,7 @@ pub fn run() {
             refresh_menu(&handle, None);
             watch_launcher_window(&handle);
             let state = app.state::<Arc<Launcher>>().inner().clone();
+            *lock(&state.opened_tab) = recall_open_tab();
             spawn_update_watcher(handle.clone(), state.clone());
             spawn_health_watch(handle.clone(), state.clone());
             thread::spawn(move || {
@@ -2659,9 +2578,16 @@ pub fn run() {
         .build(tauri::generate_context!())
         .expect("could not start the launcher")
         .run(|app, event| match event {
-            // Quitting from the menu, the Dock or Cmd+Q arrives here rather
-            // than as a window close, and it needs the same treatment: the
-            // stop takes seconds, and doing it inline freezes the window.
+            // Clicking the Dock icon, or opening the app again from Finder,
+            // means "show me Kayak": in the browser when it is ready, otherwise
+            // the launcher window, which says what is happening.
+            RunEvent::Reopen { .. } => {
+                if let Some(state) = app.try_state::<Arc<Launcher>>() {
+                    open_kayak_now(app.clone(), state.inner().clone());
+                }
+            }
+            // Quitting from the menu, the Dock or Cmd+Q arrives here, and the
+            // stop takes seconds: doing it inline would freeze the app.
             RunEvent::ExitRequested { api, code, .. } => {
                 let Some(state) = app.try_state::<Arc<Launcher>>() else {
                     return;
@@ -2682,7 +2608,7 @@ pub fn run() {
             }
             // Last resort. Both the container and the Metal server outlive this
             // process unless they are stopped, and either left running would
-            // keep serving an app that no longer has a window.
+            // keep serving an app that is no longer there to stop it.
             RunEvent::Exit => {
                 if let Some(state) = app.try_state::<Arc<Launcher>>() {
                     stop_everything(state.inner());
@@ -2695,39 +2621,6 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::{Read, Write};
-    use std::net::TcpListener;
-    use std::path::PathBuf;
-
-    #[test]
-    fn cache_busted_urls_point_at_the_server_root() {
-        let busted = cache_busted("http://127.0.0.1:8001");
-        assert!(
-            busted.starts_with("http://127.0.0.1:8001/?fresh="),
-            "unexpected shape: {busted}"
-        );
-        assert!(busted.parse::<tauri::Url>().is_ok());
-    }
-
-    #[test]
-    fn no_two_navigations_share_a_cache_entry() {
-        // The whole point: a URL that already sits in the webview cache would
-        // be served from it, resurrecting a previous release's UI.
-        assert_ne!(cache_busted("http://127.0.0.1:8001"), cache_busted("http://127.0.0.1:8001"));
-    }
-
-    #[test]
-    fn reloading_keeps_the_page_and_replaces_the_cache_buster() {
-        let current: Url = "http://127.0.0.1:8000/agents/42?tab=runs&fresh=1-0".parse().unwrap();
-
-        let reloaded = refreshed(&current);
-
-        assert_eq!(reloaded.path(), "/agents/42");
-        let pairs: Vec<(String, String)> = reloaded.query_pairs().into_owned().collect();
-        assert_eq!(pairs.iter().filter(|(key, _)| key == "fresh").count(), 1);
-        assert!(pairs.contains(&("tab".to_string(), "runs".to_string())));
-        assert!(!pairs.contains(&("fresh".to_string(), "1-0".to_string())));
-    }
 
     #[test]
     fn reuses_a_container_from_the_current_image() {
@@ -2746,6 +2639,79 @@ mod tests {
         assert!(!should_reuse(None, Some("sha256:aaa")));
         assert!(!should_reuse(Some("sha256:aaa"), None));
         assert!(!should_reuse(None, None));
+    }
+
+    #[test]
+    fn an_app_update_is_installed_by_itself_once() {
+        assert!(retry_launcher_update(None, "1.4.0"));
+        assert!(retry_launcher_update(Some("1.3.5"), "1.4.0"));
+        // Installed before and offered again: it did not take. That includes
+        // the Apple-chip build offered to an Intel build at the same version,
+        // which would otherwise be installed again at every launch.
+        assert!(!retry_launcher_update(Some("1.4.0\n"), "1.4.0"));
+    }
+
+    #[test]
+    fn a_tab_is_remembered_across_a_restart_and_only_that_restart() {
+        let tab = OpenTab {
+            port: 8000,
+            signed_in_as: Some("0123456789ab".to_string()),
+        };
+        let written = encode_open_tab(&tab);
+
+        assert_eq!(decode_open_tab(&written, Duration::from_secs(20)), Some(tab));
+        assert_eq!(
+            decode_open_tab("8001\n", Duration::ZERO),
+            Some(OpenTab {
+                port: 8001,
+                signed_in_as: None
+            })
+        );
+        // Long enough ago that it is not the restart just made.
+        assert_eq!(decode_open_tab(&written, Duration::from_secs(3600)), None);
+        assert_eq!(decode_open_tab("garbage", Duration::ZERO), None);
+        assert_eq!(decode_open_tab("0\n", Duration::ZERO), None);
+    }
+
+    #[test]
+    fn a_tab_is_left_to_reconnect_only_while_it_is_still_signed_in() {
+        let key = fingerprint("0123456789abcdef0123456789abcdef");
+        let tab = OpenTab {
+            port: 8000,
+            signed_in_as: Some(key.clone()),
+        };
+
+        assert!(tab_reconnects(Some(&tab), 8000, Some(&key)));
+        // Another port, another key, or a server that only now has one: the tab
+        // cannot sign itself in, so a new one is opened.
+        assert!(!tab_reconnects(Some(&tab), 8001, Some(&key)));
+        assert!(!tab_reconnects(Some(&tab), 8000, Some("fedcba987654")));
+        let unsigned = OpenTab {
+            port: 8000,
+            signed_in_as: None,
+        };
+        assert!(!tab_reconnects(Some(&unsigned), 8000, Some(&key)));
+        assert!(tab_reconnects(Some(&unsigned), 8000, None));
+        // A tab that could not be signed in is not remembered at all.
+        assert!(!tab_reconnects(None, 8000, None));
+    }
+
+    #[test]
+    fn a_fingerprint_does_not_hold_the_key() {
+        let key = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(fingerprint(key).len(), 12);
+        assert!(key.starts_with(&fingerprint(key)));
+    }
+
+    #[test]
+    fn a_half_finished_download_still_counts_as_out_of_date() {
+        assert!(!kayak_outdated("sha256:s1", Some("sha256:b1"), "sha256:s1", Some("sha256:b1")));
+        assert!(kayak_outdated("sha256:s1", Some("sha256:b1"), "sha256:s2", Some("sha256:b2")));
+        // The server arrived, the sandbox did not: not up to date.
+        assert!(kayak_outdated("sha256:s2", Some("sha256:b1"), "sha256:s2", Some("sha256:b2")));
+        // A sandbox digest that is not known says nothing either way.
+        assert!(!kayak_outdated("sha256:s2", None, "sha256:s2", Some("sha256:b2")));
+        assert!(!kayak_outdated("sha256:s2", Some("sha256:b1"), "sha256:s2", None));
     }
 
     fn failure(model: &str, request: Option<&str>) -> MetalFailure {
@@ -2800,22 +2766,6 @@ mod tests {
             ..desired(true, "mlx-community/X", "first")
         };
         assert!(still_wanted(&began, &with_token));
-    }
-
-    #[test]
-    fn old_images_are_kept_when_the_current_ones_cannot_all_be_read() {
-        let old = vec!["sha256:old-server".to_string(), "sha256:sandbox".to_string()];
-
-        // A failed lookup must not leave the sandbox in use off the list of
-        // current images, and so get it deleted.
-        assert!(no_longer_used(&old, None).is_empty());
-        assert_eq!(
-            no_longer_used(
-                &old,
-                Some(vec!["sha256:new-server".to_string(), "sha256:sandbox".to_string()])
-            ),
-            vec!["sha256:old-server".to_string()]
-        );
     }
 
     #[test]
@@ -2887,75 +2837,4 @@ mod tests {
         assert!(told < log);
     }
 
-    /// Answers one request with `response`, returning the URL to fetch it from.
-    fn serve_once(response: &'static [u8]) -> String {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0u8; 1024];
-            let _ = stream.read(&mut request);
-            let _ = stream.write_all(response);
-        });
-        format!("http://127.0.0.1:{port}/api/audio/items/1/file")
-    }
-
-    fn scratch(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join("kayak-launcher-download");
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join(name);
-        let _ = std::fs::remove_file(&path);
-        path
-    }
-
-    #[test]
-    fn sends_the_access_key_to_kayak_and_nowhere_else() {
-        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
-        let port = listener.local_addr().unwrap().port();
-        let server = std::thread::spawn(move || {
-            let (mut stream, _) = listener.accept().unwrap();
-            let mut request = [0u8; 2048];
-            let read = stream.read(&mut request).unwrap_or(0);
-            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok");
-            String::from_utf8_lossy(&request[..read]).to_lowercase()
-        });
-        let path = scratch("with-key.wav");
-
-        save_url(&format!("http://127.0.0.1:{port}/file"), &path, Some("secret")).unwrap();
-
-        assert!(server.join().unwrap().contains("x-kayak-token: secret"));
-        assert!(super::is_loopback_url("http://localhost:8000/x"));
-        assert!(!super::is_loopback_url("https://example.com/file"));
-    }
-
-    #[test]
-    fn saves_the_file_where_the_user_chose() {
-        let url = serve_once(b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nRIFF!");
-        let path = scratch("saved.wav");
-
-        save_url(&url, &path, None).unwrap();
-
-        assert_eq!(std::fs::read(&path).unwrap(), b"RIFF!");
-    }
-
-    #[test]
-    fn a_refused_download_creates_nothing() {
-        let url = serve_once(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
-        let path = scratch("missing.wav");
-
-        let error = save_url(&url, &path, None).unwrap_err();
-
-        assert!(error.contains("404"), "{error}");
-        assert!(!path.exists());
-    }
-
-    #[test]
-    fn a_download_cut_short_leaves_no_partial_file() {
-        // The server promises more than it sends, then hangs up.
-        let url = serve_once(b"HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nRIFF");
-        let path = scratch("partial.wav");
-
-        assert!(save_url(&url, &path, None).is_err());
-        assert!(!path.exists());
-    }
 }

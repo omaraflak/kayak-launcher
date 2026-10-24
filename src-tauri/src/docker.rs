@@ -678,7 +678,7 @@ pub fn run_container(spec: &RunSpec) -> Result<(), String> {
         crate::config::DOCKER_SOCKET
     );
     let internal_port = format!("KAYAK_PORT={}", crate::config::INTERNAL_PORT);
-    // The server checks the request origin, and the launcher window loads Kayak
+    // The server checks the request origin, and the browser loads Kayak
     // over the resolved host port, which is not always the default one.
     let cors = format!(
         "KAYAK_CORS_ORIGINS=http://127.0.0.1:{port},http://localhost:{port}",
